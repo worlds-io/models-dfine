@@ -54,6 +54,7 @@ def train_one_epoch(
     ema: ModelEMA = kwargs.get("ema", None)
     scaler: GradScaler = kwargs.get("scaler", None)
     lr_warmup_scheduler: Warmup = kwargs.get("lr_warmup_scheduler", None)
+    grad_accum_steps = kwargs.get("gradient_accumulation_steps", 1)
     losses = []
 
     output_dir = kwargs.get("output_dir", None)
@@ -70,6 +71,8 @@ def train_one_epoch(
 
         samples = samples.to(device)
         targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
+
+        is_accum_step = (i + 1) % grad_accum_steps != 0
 
         if scaler is not None:
             with torch.autocast(device_type=str(device), cache_enabled=True):
@@ -90,36 +93,39 @@ def train_one_epoch(
             with torch.autocast(device_type=str(device), enabled=False):
                 loss_dict = criterion(outputs, targets, **metas)
 
-            loss = sum(loss_dict.values())
+            loss = sum(loss_dict.values()) / grad_accum_steps
             scaler.scale(loss).backward()
 
-            if max_norm > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            if not is_accum_step:
+                if max_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
 
         else:
             outputs = model(samples, targets=targets)
             loss_dict = criterion(outputs, targets, **metas)
 
-            loss: torch.Tensor = sum(loss_dict.values())
-            optimizer.zero_grad()
+            loss: torch.Tensor = sum(loss_dict.values()) / grad_accum_steps
             loss.backward()
 
-            if max_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            if not is_accum_step:
+                if max_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
-            optimizer.step()
+                optimizer.step()
+                optimizer.zero_grad()
 
-        # ema
-        if ema is not None:
-            ema.update(model)
+        # ema and warmup update on every optimizer step
+        if not is_accum_step:
+            if ema is not None:
+                ema.update(model)
 
-        if lr_warmup_scheduler is not None:
-            lr_warmup_scheduler.step()
+            if lr_warmup_scheduler is not None:
+                lr_warmup_scheduler.step()
 
         loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
         loss_value = sum(loss_dict_reduced.values())

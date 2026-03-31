@@ -86,6 +86,7 @@ class DetSolver(BaseSolver):
                 writer=self.writer,
                 use_wandb=False,
                 output_dir=self.output_dir,
+                gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
             )
 
             if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():
