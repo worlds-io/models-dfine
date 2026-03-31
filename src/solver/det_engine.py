@@ -13,7 +13,7 @@ from typing import Dict, Iterable, List
 import numpy as np
 import torch
 import torch.amp
-from torch.cuda.amp.grad_scaler import GradScaler
+from torch.amp import GradScaler
 try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:

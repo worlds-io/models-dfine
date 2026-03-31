@@ -8,7 +8,7 @@ from typing import Callable, Dict, List
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp.grad_scaler import GradScaler
+from torch.amp import GradScaler
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader, Dataset
