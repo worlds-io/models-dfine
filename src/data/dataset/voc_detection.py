@@ -10,8 +10,6 @@ import torch
 import torchvision
 import torchvision.transforms.functional as TVF
 from PIL import Image
-from sympy import im
-
 try:
     from defusedxml.ElementTree import parse as ET_parse
 except ImportError:

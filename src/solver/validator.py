@@ -3,10 +3,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from loguru import logger
 from torchvision.ops import box_iou
 
 
@@ -244,6 +242,8 @@ class Validator:
         return metrics_per_class, conf_matrix, class_to_idx
 
     def save_plots(self, path_to_save) -> None:
+        import matplotlib.pyplot as plt
+
         path_to_save = Path(path_to_save)
         path_to_save.mkdir(parents=True, exist_ok=True)
 
@@ -317,6 +317,8 @@ class Validator:
         best_idx = len(f1_scores) - np.argmax(f1_scores[::-1]) - 1
         best_threshold = thresholds[best_idx]
         best_f1 = f1_scores[best_idx]
+
+        from loguru import logger
 
         logger.info(
             f"Best Threshold: {round(best_threshold, 2)} with F1 Score: {round(best_f1, 3)}"
