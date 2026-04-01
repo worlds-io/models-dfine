@@ -39,6 +39,7 @@ def safe_get_rank():
 def main(args) -> None:
     """main"""
     dist_utils.setup_distributed(args.print_rank, args.print_method, seed=args.seed)
+    torch.backends.cudnn.benchmark = True
 
     assert not all(
         [args.tuning, args.resume]

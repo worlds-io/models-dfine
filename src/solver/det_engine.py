@@ -10,7 +10,6 @@ import math
 import sys
 from typing import Dict, Iterable, List
 
-import numpy as np
 import torch
 import torch.amp
 from torch.amp import GradScaler
@@ -55,7 +54,6 @@ def train_one_epoch(
     scaler: GradScaler = kwargs.get("scaler", None)
     lr_warmup_scheduler: Warmup = kwargs.get("lr_warmup_scheduler", None)
     grad_accum_steps = kwargs.get("gradient_accumulation_steps", 1)
-    losses = []
 
     output_dir = kwargs.get("output_dir", None)
     num_visualization_sample_batch = kwargs.get("num_visualization_sample_batch", 1)
@@ -69,8 +67,13 @@ def train_one_epoch(
         if global_step < num_visualization_sample_batch and output_dir is not None and dist_utils.is_main_process():
             save_samples(samples, targets, output_dir, "train", normalized=True, box_fmt="cxcywh")
 
-        samples = samples.to(device)
-        targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
+        samples = samples.to(device, non_blocking=True)
+        targets = [{k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
+
+        # Multi-scale resize on GPU (scale chosen by collate_fn, passed via targets)
+        multiscale_size = targets[0].pop('_multiscale_size', None)
+        if multiscale_size is not None:
+            samples = torch.nn.functional.interpolate(samples, size=multiscale_size)
 
         is_accum_step = (i + 1) % grad_accum_steps != 0
 
@@ -103,7 +106,7 @@ def train_one_epoch(
 
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
         else:
             outputs = model(samples, targets=targets)
@@ -117,7 +120,7 @@ def train_one_epoch(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
                 optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
         # ema and warmup update on every optimizer step
         if not is_accum_step:
@@ -129,10 +132,9 @@ def train_one_epoch(
 
         loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
         loss_value = sum(loss_dict_reduced.values())
-        losses.append(loss_value.detach().cpu().numpy())
 
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
+        if not math.isfinite(loss_value.item()):
+            print("Loss is {}, stopping training".format(loss_value.item()))
             print(loss_dict_reduced)
             sys.exit(1)
 
@@ -149,10 +151,6 @@ def train_one_epoch(
             for k, v in loss_dict_reduced.items():
                 writer.add_scalar(f"Loss/{k}", v.item(), global_step)
 
-    if use_wandb:
-        wandb.log(
-            {"lr": optimizer.param_groups[0]["lr"], "epoch": epoch, "train/loss": np.mean(losses)}
-        )
     metric_logger.synchronize_between_processes()
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
@@ -188,8 +186,8 @@ def evaluate(
     output_dir = kwargs.get("output_dir", None)
 
     for samples, targets in data_loader:
-        samples = samples.to(device)
-        targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
+        samples = samples.to(device, non_blocking=True)
+        targets = [{k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
 
         outputs = model(samples)
 
