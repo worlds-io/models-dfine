@@ -5,9 +5,6 @@ Copyright (c) 2024 The D-FINE Authors. All Rights Reserved.
 import copy
 from typing import Tuple
 
-from calflops import calculate_flops
-
-
 def stats(
     cfg,
     input_shape: Tuple = (1, 3, 640, 640),
@@ -16,6 +13,8 @@ def stats(
     input_shape = (1, 3, base_size, base_size)
 
     model_for_info = copy.deepcopy(cfg.model).deploy()
+
+    from calflops import calculate_flops
 
     flops, macs, _ = calculate_flops(
         model=model_for_info,

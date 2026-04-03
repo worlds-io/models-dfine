@@ -3,10 +3,10 @@ Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
-import torch.cuda.amp as amp
+import torch.amp
 
 from ..core import register
 
 __all__ = ["GradScaler"]
 
-GradScaler = register()(amp.grad_scaler.GradScaler)
+GradScaler = register()(torch.amp.GradScaler)

@@ -97,7 +97,7 @@ class BatchImageCollateFunction(BaseCollateFunction):
         super().__init__()
         self.base_size = base_size
         self.scales = (
-            generate_scales(base_size, base_size_repeat) if base_size_repeat is not None else None
+            generate_scales(base_size, base_size_repeat) if base_size_repeat else None
         )
         self.stop_epoch = stop_epoch if stop_epoch is not None else 100000000
         self.ema_restart_decay = ema_restart_decay
@@ -108,15 +108,6 @@ class BatchImageCollateFunction(BaseCollateFunction):
         targets = [x[1] for x in items]
 
         if self.scales is not None and self.epoch < self.stop_epoch:
-            # sz = random.choice(self.scales)
-            # sz = [sz] if isinstance(sz, int) else list(sz)
-            # VF.resize(inpt, sz, interpolation=self.interpolation)
-
-            sz = random.choice(self.scales)
-            images = F.interpolate(images, size=sz)
-            if "masks" in targets[0]:
-                for tg in targets:
-                    tg["masks"] = F.interpolate(tg["masks"], size=sz, mode="nearest")
-                raise NotImplementedError("")
+            targets[0]['_multiscale_size'] = random.choice(self.scales)
 
         return images, targets

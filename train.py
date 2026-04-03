@@ -39,6 +39,7 @@ def safe_get_rank():
 def main(args) -> None:
     """main"""
     dist_utils.setup_distributed(args.print_rank, args.print_method, seed=args.seed)
+    torch.backends.cudnn.benchmark = True
 
     assert not all(
         [args.tuning, args.resume]
@@ -63,9 +64,7 @@ def main(args) -> None:
         if "HGNetv2" in cfg.yaml_cfg:
             cfg.yaml_cfg["HGNetv2"]["pretrained"] = False
 
-    if safe_get_rank() == 0:
-        print("cfg: ")
-        pprint(cfg.__dict__)
+    # suppress verbose cfg dump
 
     solver = TASKS[cfg.yaml_cfg["task"]](cfg)
 
