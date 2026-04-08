@@ -78,6 +78,28 @@ class BaseCollateFunction(object):
 
 
 def generate_scales(base_size, base_size_repeat):
+    if isinstance(base_size, (list, tuple)):
+        base_h, base_w = base_size
+        # Use the larger dimension to determine scale steps
+        ref = max(base_h, base_w)
+        scale_repeat = (ref - int(ref * 0.75 / 32) * 32) // 32
+        # Generate scale factors from 0.75x to 1.25x in 32-pixel steps of the reference dim
+        factors = []
+        for i in range(scale_repeat):
+            s = int(ref * 0.75 / 32) * 32 + i * 32
+            factors.append(s / ref)
+        factors += [1.0] * base_size_repeat
+        for i in range(scale_repeat):
+            s = int(ref * 1.25 / 32) * 32 - i * 32
+            factors.append(s / ref)
+        # Apply factors to both dimensions, rounding to nearest multiple of 32
+        scales = []
+        for f in factors:
+            h = int(round(base_h * f / 32)) * 32
+            w = int(round(base_w * f / 32)) * 32
+            scales.append((h, w))
+        return scales
+    # Original scalar path
     scale_repeat = (base_size - int(base_size * 0.75 / 32) * 32) // 32
     scales = [int(base_size * 0.75 / 32) * 32 + i * 32 for i in range(scale_repeat)]
     scales += [base_size] * base_size_repeat

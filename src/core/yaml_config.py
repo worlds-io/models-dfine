@@ -23,6 +23,19 @@ class YAMLConfig(BaseConfig):
         cfg = load_config(cfg_path)
         cfg = merge_dict(cfg, kwargs)
 
+        # Propagate eval_spatial_size to Resize transforms in dataloaders so that
+        # overriding eval_spatial_size (e.g. via -u) automatically updates all resize ops.
+        if "eval_spatial_size" in cfg:
+            spatial_size = cfg["eval_spatial_size"]
+            for loader_key in ("train_dataloader", "val_dataloader"):
+                ops = (cfg.get(loader_key, {})
+                       .get("dataset", {})
+                       .get("transforms", {})
+                       .get("ops", []))
+                for op in ops:
+                    if isinstance(op, dict) and op.get("type") == "Resize":
+                        op["size"] = list(spatial_size)
+
         self.yaml_cfg = copy.deepcopy(cfg)
 
         for k in super().__dict__:
