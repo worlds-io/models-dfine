@@ -416,8 +416,8 @@ class HybridEncoder(nn.Module):
             for idx in self.use_encoder_idx:
                 stride = self.feat_strides[idx]
                 pos_embed = self.build_2d_sincos_position_embedding(
-                    self.eval_spatial_size[1] // stride,
                     self.eval_spatial_size[0] // stride,
+                    self.eval_spatial_size[1] // stride,
                     self.hidden_dim,
                     self.pe_temperature,
                 )
@@ -425,11 +425,15 @@ class HybridEncoder(nn.Module):
                 # self.register_buffer(f'pos_embed{idx}', pos_embed)
 
     @staticmethod
-    def build_2d_sincos_position_embedding(w, h, embed_dim=256, temperature=10000.0):
-        """ """
-        grid_w = torch.arange(int(w), dtype=torch.float32)
+    def build_2d_sincos_position_embedding(h, w, embed_dim=256, temperature=10000.0):
+        """Build 2D sin-cos position embedding.
+
+        The grid is created in [H, W] layout so that row-major flattening
+        matches the feature tensor flattened from [B, C, H, W].
+        """
         grid_h = torch.arange(int(h), dtype=torch.float32)
-        grid_w, grid_h = torch.meshgrid(grid_w, grid_h, indexing="ij")
+        grid_w = torch.arange(int(w), dtype=torch.float32)
+        grid_h, grid_w = torch.meshgrid(grid_h, grid_w, indexing="ij")
         assert (
             embed_dim % 4 == 0
         ), "Embed dimension must be divisible by 4 for 2D sin-cos position embedding"
@@ -437,10 +441,10 @@ class HybridEncoder(nn.Module):
         omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
         omega = 1.0 / (temperature**omega)
 
-        out_w = grid_w.flatten()[..., None] @ omega[None]
         out_h = grid_h.flatten()[..., None] @ omega[None]
+        out_w = grid_w.flatten()[..., None] @ omega[None]
 
-        return torch.concat([out_w.sin(), out_w.cos(), out_h.sin(), out_h.cos()], dim=1)[None, :, :]
+        return torch.concat([out_h.sin(), out_h.cos(), out_w.sin(), out_w.cos()], dim=1)[None, :, :]
 
     def forward(self, feats):
         assert len(feats) == len(self.in_channels)
@@ -454,7 +458,7 @@ class HybridEncoder(nn.Module):
                 src_flatten = proj_feats[enc_ind].flatten(2).permute(0, 2, 1)
                 if self.training or self.eval_spatial_size is None:
                     pos_embed = self.build_2d_sincos_position_embedding(
-                        w, h, self.hidden_dim, self.pe_temperature
+                        h, w, self.hidden_dim, self.pe_temperature
                     ).to(src_flatten.device)
                 else:
                     pos_embed = getattr(self, f"pos_embed{enc_ind}", None).to(src_flatten.device)
