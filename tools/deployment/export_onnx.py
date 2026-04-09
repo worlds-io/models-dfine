@@ -63,7 +63,12 @@ def main(args):
     dynamic_axes = {"images": {0: "N"}, "labels": {0: "N"}, "boxes": {0: "N"}, "scores": {0: "N"}}
 
     import os
-    output_file = os.path.splitext(args.resume)[0] + ".onnx" if args.resume else "model.onnx"
+    if args.output:
+        output_file = args.output
+    elif args.resume:
+        output_file = os.path.splitext(args.resume)[0] + ".onnx"
+    else:
+        output_file = "model.onnx"
 
     torch.onnx.export(
         model,
@@ -77,8 +82,14 @@ def main(args):
         do_constant_folding=True,
     )
 
+    import onnx
+    import onnxsim
+    onnx_model = onnx.load(output_file)
+    onnx_model, check = onnxsim.simplify(onnx_model)
+    onnx.save(onnx_model, output_file)
+    print(f"Simplify onnx model: {check}")
+
     if args.check:
-        import onnx
         onnx_model = onnx.load(output_file)
         onnx.checker.check_model(onnx_model)
         print("Check export onnx model done...")
@@ -92,6 +103,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume", "-r", type=str)
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--check", action="store_true", default=True)
+    parser.add_argument("-o", "--output", type=str, help="output onnx file path")
     parser.add_argument("-u", "--update", nargs="+", help="update yaml config")
     args = parser.parse_args()
     main(args)
