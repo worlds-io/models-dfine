@@ -26,6 +26,7 @@ class DetSolver(BaseSolver):
         print(f"Trainable params: {n_parameters:,}")
 
         early_stopping_patience = getattr(args, 'early_stopping_patience', 0)
+        early_stopping_min_delta = getattr(args, 'early_stopping_min_delta', 0)
 
         top1 = 0
         best_stat = {"epoch": -1}
@@ -104,7 +105,9 @@ class DetSolver(BaseSolver):
                 output_dir=self.output_dir,
             )
 
-            # Track improvement for early stopping
+            # Track improvement for early stopping.
+            # Requires improvement > min_delta to count as meaningful;
+            # micro-improvements still update best_stat for checkpoint tracking.
             improved = False
             for k in test_stats:
                 if self.writer and dist_utils.is_main_process():
@@ -112,10 +115,11 @@ class DetSolver(BaseSolver):
                         self.writer.add_scalar(f"Test/{k}_{i}".format(k), v, epoch)
 
                 if k in best_stat:
+                    if test_stats[k][0] > best_stat[k] + early_stopping_min_delta:
+                        improved = True
                     if test_stats[k][0] > best_stat[k]:
                         best_stat["epoch"] = epoch
                         best_stat[k] = test_stats[k][0]
-                        improved = True
                 else:
                     best_stat["epoch"] = epoch
                     best_stat[k] = test_stats[k][0]
@@ -183,7 +187,7 @@ class DetSolver(BaseSolver):
         print("Training time {}".format(total_time_str))
 
     def _enter_stage2(self, epoch):
-        """Transition from stage 1 to stage 2: reload best checkpoint, disable augmentation, refresh EMA."""
+        """Transition from stage 1 to stage 2: reload best checkpoint, disable augmentation, drop LR, refresh EMA."""
         print(f"Entering stage 2 at epoch {epoch}")
         best_stg1_path = str(self.output_dir / "best_stg1.pth")
         if dist_utils.is_dist_available_and_initialized():
@@ -195,6 +199,11 @@ class DetSolver(BaseSolver):
         if hasattr(self.train_dataloader.dataset, 'transforms') and \
                 hasattr(self.train_dataloader.dataset.transforms, 'policy'):
             self.train_dataloader.dataset.transforms.policy["epoch"] = epoch
+
+        # Drop LR by 10x for fine-grained refinement
+        for pg in self.optimizer.param_groups:
+            pg['lr'] *= 0.1
+        print(f"Stage 2 LR: {[pg['lr'] for pg in self.optimizer.param_groups]}")
 
         if self.ema:
             self.ema.decay = self.train_dataloader.collate_fn.ema_restart_decay
