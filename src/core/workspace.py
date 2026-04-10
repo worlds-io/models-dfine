@@ -170,9 +170,15 @@ def create(type_or_name, global_cfg=GLOBAL_CONFIG, **kwargs):
     # TODO hard code
     module_kwargs = {k: v for k, v in module_kwargs.items() if not k.startswith("_")}
 
-    # TODO for **kwargs
-    # extra_args = set(module_kwargs.keys()) - set(arg_names)
-    # if len(extra_args) > 0:
-    #     raise RuntimeError(f'Error: unknown args {extra_args} for {module}')
+    # Filter out kwargs that the constructor doesn't accept (e.g. stale keys
+    # left over after switching lr_scheduler type via config overrides).
+    import inspect
+    sig = inspect.signature(module)
+    has_var_keyword = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    if not has_var_keyword:
+        valid_params = set(sig.parameters.keys())
+        module_kwargs = {k: v for k, v in module_kwargs.items() if k in valid_params}
 
     return module(**module_kwargs)

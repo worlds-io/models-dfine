@@ -80,7 +80,7 @@ class DetSolver(BaseSolver):
                 gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
             )
 
-            if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():
+            if stage == 1 and (self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished()):
                 self.lr_scheduler.step()
 
             self.last_epoch += 1
