@@ -26,7 +26,6 @@ class DetSolver(BaseSolver):
         print(f"Trainable params: {n_parameters:,}")
 
         early_stopping_patience = getattr(args, 'early_stopping_patience', 0)
-        stg2_max_epochs = getattr(args, 'stg2_max_epochs', 8)
 
         top1 = 0
         best_stat = {"epoch": -1}
@@ -53,7 +52,6 @@ class DetSolver(BaseSolver):
         start_epoch = self.last_epoch + 1
         epochs_without_improvement = 0
         stage = 1
-        stg2_epoch_count = 0
 
         for epoch in range(start_epoch, args.epochs):
             epoch_start_time = time.time()
@@ -61,14 +59,6 @@ class DetSolver(BaseSolver):
             self.train_dataloader.set_epoch(epoch)
             if dist_utils.is_dist_available_and_initialized():
                 self.train_dataloader.sampler.set_epoch(epoch)
-
-            # Stage 2 transition at stop_epoch
-            if stage == 1 and epoch == self.train_dataloader.collate_fn.stop_epoch:
-                self._enter_stage2(epoch)
-                stage = 2
-                stg2_epoch_count = 0
-                epochs_without_improvement = 0
-                top1 = 0
 
             train_stats = train_one_epoch(
                 self.model,
@@ -152,27 +142,18 @@ class DetSolver(BaseSolver):
             else:
                 epochs_without_improvement += 1
 
-            if stage == 2:
-                stg2_epoch_count += 1
-
-            # Early stopping check
+            # Early stopping: transition stages or stop training
             if early_stopping_patience > 0 and epochs_without_improvement >= early_stopping_patience:
                 if stage == 1:
                     print(f"Stage 1 early stopping at epoch {epoch} (no improvement for {early_stopping_patience} epochs)")
                     self._enter_stage2(epoch)
                     stage = 2
-                    stg2_epoch_count = 0
                     epochs_without_improvement = 0
                     top1 = 0
                     continue
                 else:
                     print(f"Stage 2 early stopping at epoch {epoch} (no improvement for {early_stopping_patience} epochs)")
                     break
-
-            # Hard cap on stage 2 epochs
-            if stage == 2 and stg2_epoch_count >= stg2_max_epochs:
-                print(f"Stage 2 reached max epochs ({stg2_max_epochs}) at epoch {epoch}")
-                break
 
             log_stats = {
                 **{f"train_{k}": v for k, v in train_stats.items()},
@@ -202,12 +183,19 @@ class DetSolver(BaseSolver):
         print("Training time {}".format(total_time_str))
 
     def _enter_stage2(self, epoch):
-        """Transition from stage 1 to stage 2: reload best checkpoint, refresh EMA."""
+        """Transition from stage 1 to stage 2: reload best checkpoint, disable augmentation, refresh EMA."""
         print(f"Entering stage 2 at epoch {epoch}")
         best_stg1_path = str(self.output_dir / "best_stg1.pth")
         if dist_utils.is_dist_available_and_initialized():
             torch.distributed.barrier()
         self.load_resume_state(best_stg1_path)
+
+        # Disable augmentation for stage 2 refinement
+        self.train_dataloader.collate_fn.stop_epoch = epoch
+        if hasattr(self.train_dataloader.dataset, 'transforms') and \
+                hasattr(self.train_dataloader.dataset.transforms, 'policy'):
+            self.train_dataloader.dataset.transforms.policy["epoch"] = epoch
+
         if self.ema:
             self.ema.decay = self.train_dataloader.collate_fn.ema_restart_decay
             print(f"Refreshed EMA with decay {self.ema.decay}")
