@@ -73,7 +73,7 @@ class DetSolver(BaseSolver):
                 print_freq=args.print_freq,
                 ema=self.ema,
                 scaler=self.scaler,
-                lr_warmup_scheduler=self.lr_warmup_scheduler,
+                lr_warmup_scheduler=self.lr_warmup_scheduler if stage == 1 else None,
                 writer=self.writer,
                 use_wandb=False,
                 output_dir=self.output_dir,
