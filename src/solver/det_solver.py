@@ -149,14 +149,14 @@ class DetSolver(BaseSolver):
             # Early stopping: transition stages or stop training
             if early_stopping_patience > 0 and epochs_without_improvement >= early_stopping_patience:
                 if stage == 1:
-                    print(f"Stage 1 early stopping at epoch {epoch} (no improvement for {early_stopping_patience} epochs)")
+                    print(f"Stage 1 early stopping at epoch {epoch + 1} (no improvement for {early_stopping_patience} epochs)")
                     self._enter_stage2(epoch)
                     stage = 2
                     epochs_without_improvement = 0
                     top1 = 0
                     continue
                 else:
-                    print(f"Stage 2 early stopping at epoch {epoch} (no improvement for {early_stopping_patience} epochs)")
+                    print(f"Stage 2 early stopping at epoch {epoch + 1} (no improvement for {early_stopping_patience} epochs)")
                     break
 
             log_stats = {
@@ -188,7 +188,7 @@ class DetSolver(BaseSolver):
 
     def _enter_stage2(self, epoch):
         """Transition from stage 1 to stage 2: reload best checkpoint, disable augmentation, drop LR, refresh EMA."""
-        print(f"Entering stage 2 at epoch {epoch}")
+        print(f"Entering stage 2 at epoch {epoch + 1}")
         best_stg1_path = str(self.output_dir / "best_stg1.pth")
         if dist_utils.is_dist_available_and_initialized():
             torch.distributed.barrier()

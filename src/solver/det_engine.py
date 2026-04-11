@@ -45,7 +45,7 @@ def train_one_epoch(
     metric_logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6f}"))
 
     epochs = kwargs.get("epochs", None)
-    header = "Epoch: [{}]".format(epoch) if epochs is None else "Epoch: [{}/{}]".format(epoch, epochs)
+    header = "Epoch: [{}]".format(epoch + 1) if epochs is None else "Epoch: [{}/{}]".format(epoch + 1, epochs)
 
     print_freq = kwargs.get("print_freq", 10)
     writer: SummaryWriter = kwargs.get("writer", None)
