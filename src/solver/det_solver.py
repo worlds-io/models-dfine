@@ -118,36 +118,34 @@ class DetSolver(BaseSolver):
                     for i, v in enumerate(test_stats[k]):
                         self.writer.add_scalar(f"Test/{k}_{i}".format(k), v, epoch)
 
+                current_map = test_stats[k][0]
                 if k in best_stat:
-                    if test_stats[k][0] > best_stat[k] + early_stopping_min_delta:
+                    prev_best = best_stat[k]
+                    if current_map > prev_best + early_stopping_min_delta:
                         improved = True
-                    if test_stats[k][0] > best_stat[k]:
+                    if current_map > prev_best:
                         best_stat["epoch"] = epoch
-                        best_stat[k] = test_stats[k][0]
+                        best_stat[k] = current_map
                 else:
+                    prev_best = 0
                     best_stat["epoch"] = epoch
-                    best_stat[k] = test_stats[k][0]
+                    best_stat[k] = current_map
                     improved = True
 
-                if test_stats[k][0] > top1:
-                    best_stat_print["epoch"] = epoch
-                    top1 = test_stats[k][0]
-
+                if current_map > top1:
+                    top1 = current_map
                     if self.output_dir:
                         if stage == 2:
                             dist_utils.save_on_master(self.state_dict(), self.output_dir / "best_stg2.pth")
                         else:
                             dist_utils.save_on_master(self.state_dict(), self.output_dir / "best_stg1.pth")
 
-                best_stat_print[k] = max(best_stat.get(k, 0), top1)
-                print(f"best_stat: {best_stat_print}")
-
             epoch_time = int(time.time() - epoch_start_time)
-            print(f"Finished epoch {epoch + 1} in {epoch_time} seconds")
-
             if improved:
+                print(f"mAP improved in epoch {epoch + 1} ({prev_best:.3f} -> {current_map:.3f}), completed in {epoch_time}s")
                 epochs_without_improvement = 0
             else:
+                print(f"mAP did not improve in epoch {epoch + 1} ({prev_best:.3f} -> {current_map:.3f}), completed in {epoch_time}s")
                 epochs_without_improvement += 1
 
             # Early stopping: transition stages or stop training
