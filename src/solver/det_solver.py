@@ -22,6 +22,10 @@ class DetSolver(BaseSolver):
         self.train()
         args = self.cfg
 
+        # Freeze backbone for stage 1 — params stay in optimizer but don't compute gradients.
+        # This focuses stage 1 on the decoder/encoder and saves compute.
+        self._freeze_backbone()
+
         n_parameters = sum([p.numel() for p in self.model.parameters() if p.requires_grad])
         print(f"Trainable params: {n_parameters:,}")
 
@@ -187,7 +191,8 @@ class DetSolver(BaseSolver):
         print("Training time {}".format(total_time_str))
 
     def _enter_stage2(self, epoch):
-        """Transition from stage 1 to stage 2: reload best checkpoint, disable augmentation, drop LR, refresh EMA."""
+        """Transition from stage 1 to stage 2: reload best checkpoint, disable augmentation,
+        unfreeze late backbone, drop LR, refresh EMA."""
         print(f"Entering stage 2 at epoch {epoch + 1}")
         best_stg1_path = str(self.output_dir / "best_stg1.pth")
         if dist_utils.is_dist_available_and_initialized():
@@ -200,6 +205,11 @@ class DetSolver(BaseSolver):
                 hasattr(self.train_dataloader.dataset.transforms, 'policy'):
             self.train_dataloader.dataset.transforms.policy["epoch"] = epoch
 
+        # Re-freeze backbone (load_resume_state doesn't restore requires_grad),
+        # then unfreeze late stages for domain adaptation.
+        self._freeze_backbone()
+        self._unfreeze_backbone_late_stages()
+
         # Drop LR by 10x for fine-grained refinement
         for pg in self.optimizer.param_groups:
             pg['lr'] *= 0.1
@@ -208,6 +218,24 @@ class DetSolver(BaseSolver):
         if self.ema:
             self.ema.decay = self.train_dataloader.collate_fn.ema_restart_decay
             print(f"Refreshed EMA with decay {self.ema.decay}")
+
+    def _freeze_backbone(self):
+        """Freeze all backbone parameters. They remain in the optimizer but don't compute gradients."""
+        model = dist_utils.de_parallel(self.model)
+        if hasattr(model, 'backbone'):
+            for param in model.backbone.parameters():
+                param.requires_grad = False
+
+    def _unfreeze_backbone_late_stages(self):
+        """Unfreeze the last 2 backbone stages for domain-specific feature adaptation."""
+        model = dist_utils.de_parallel(self.model)
+        if hasattr(model, 'backbone') and hasattr(model.backbone, 'stages'):
+            # HGNetv2 has stages 0-3. Unfreeze stages 2-3 (high-level semantic features).
+            for stage in model.backbone.stages[2:]:
+                for param in stage.parameters():
+                    param.requires_grad = True
+            unfrozen = sum(p.numel() for s in model.backbone.stages[2:] for p in s.parameters() if p.requires_grad)
+            print(f"Unfroze backbone stages 2-3 ({unfrozen:,} params)")
 
     def val(self):
         self.eval()
