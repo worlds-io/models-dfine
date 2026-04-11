@@ -152,7 +152,7 @@ class DetSolver(BaseSolver):
                     print(f"Stage 1 early stopping at epoch {epoch + 1} (no improvement for {early_stopping_patience} epochs)")
                     self._enter_stage2(epoch)
                     stage = 2
-                    epochs_without_improvement = 0
+                    epochs_without_improvement = -1  # grace epoch for adapting to non-augmented data
                     top1 = 0
                     continue
                 else:
