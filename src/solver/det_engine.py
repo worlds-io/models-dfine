@@ -45,7 +45,7 @@ def train_one_epoch(
     metric_logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6f}"))
 
     epochs = kwargs.get("epochs", None)
-    header = "Epoch: [{}]".format(epoch) if epochs is None else "Epoch: [{}/{}]".format(epoch, epochs)
+    header = "Epoch: [{}]".format(epoch + 1) if epochs is None else "Epoch: [{}/{}]".format(epoch + 1, epochs)
 
     print_freq = kwargs.get("print_freq", 10)
     writer: SummaryWriter = kwargs.get("writer", None)
@@ -142,7 +142,7 @@ def train_one_epoch(
         main_losses = {k: v for k, v in loss_dict_reduced.items()
                        if not any(s in k for s in ('_aux_', '_dn_', '_pre', '_enc_'))}
         metric_logger.update(loss=loss_value, **main_losses)
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        metric_logger.update(lr=optimizer.param_groups[-1]["lr"])
 
         if writer and dist_utils.is_main_process() and global_step % 10 == 0:
             writer.add_scalar("Loss/total", loss_value.item(), global_step)

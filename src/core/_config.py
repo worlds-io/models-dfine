@@ -77,6 +77,11 @@ class BaseConfig(object):
         self.summary_dir: str = None
         self.device: str = ""
 
+        # finetuning
+        self.early_stopping_patience: int = 0
+        self.early_stopping_min_delta: float = 0
+        self.gradient_accumulation_steps: int = 1
+
     @property
     def model(self) -> nn.Module:
         return self._model

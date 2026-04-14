@@ -43,7 +43,8 @@ def main(args):
             super().__init__()
             self.model = cfg.model.deploy()
             self.postprocessor = cfg.postprocessor.deploy()
-            self.register_buffer("orig_target_sizes", torch.tensor([img_size], dtype=torch.int64))
+            # img_size is [H, W] but postprocessor expects [W, H] (matching [x, y] box order)
+            self.register_buffer("orig_target_sizes", torch.tensor([[img_size[1], img_size[0]]], dtype=torch.int64))
 
         def forward(self, images):
             # Input: NHWC uint8-range float32 [0, 255] → NCHW float32 [0, 1]

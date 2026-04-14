@@ -22,11 +22,15 @@ class DetSolver(BaseSolver):
         self.train()
         args = self.cfg
 
+        # Freeze backbone for stage 1 — params stay in optimizer but don't compute gradients.
+        # This focuses stage 1 on the decoder/encoder and saves compute.
+        self._freeze_backbone()
+
         n_parameters = sum([p.numel() for p in self.model.parameters() if p.requires_grad])
         print(f"Trainable params: {n_parameters:,}")
 
         early_stopping_patience = getattr(args, 'early_stopping_patience', 0)
-        stg2_max_epochs = getattr(args, 'stg2_max_epochs', 8)
+        early_stopping_min_delta = getattr(args, 'early_stopping_min_delta', 0)
 
         top1 = 0
         best_stat = {"epoch": -1}
@@ -53,7 +57,6 @@ class DetSolver(BaseSolver):
         start_epoch = self.last_epoch + 1
         epochs_without_improvement = 0
         stage = 1
-        stg2_epoch_count = 0
 
         for epoch in range(start_epoch, args.epochs):
             epoch_start_time = time.time()
@@ -61,14 +64,6 @@ class DetSolver(BaseSolver):
             self.train_dataloader.set_epoch(epoch)
             if dist_utils.is_dist_available_and_initialized():
                 self.train_dataloader.sampler.set_epoch(epoch)
-
-            # Stage 2 transition at stop_epoch
-            if stage == 1 and epoch == self.train_dataloader.collate_fn.stop_epoch:
-                self._enter_stage2(epoch)
-                stage = 2
-                stg2_epoch_count = 0
-                epochs_without_improvement = 0
-                top1 = 0
 
             train_stats = train_one_epoch(
                 self.model,
@@ -82,14 +77,14 @@ class DetSolver(BaseSolver):
                 print_freq=args.print_freq,
                 ema=self.ema,
                 scaler=self.scaler,
-                lr_warmup_scheduler=self.lr_warmup_scheduler,
+                lr_warmup_scheduler=self.lr_warmup_scheduler if stage == 1 else None,
                 writer=self.writer,
                 use_wandb=False,
                 output_dir=self.output_dir,
                 gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
             )
 
-            if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():
+            if stage == 1 and (self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished()):
                 self.lr_scheduler.step()
 
             self.last_epoch += 1
@@ -114,65 +109,57 @@ class DetSolver(BaseSolver):
                 output_dir=self.output_dir,
             )
 
-            # Track improvement for early stopping
+            # Track improvement for early stopping.
+            # Requires improvement > min_delta to count as meaningful;
+            # micro-improvements still update best_stat for checkpoint tracking.
             improved = False
             for k in test_stats:
                 if self.writer and dist_utils.is_main_process():
                     for i, v in enumerate(test_stats[k]):
                         self.writer.add_scalar(f"Test/{k}_{i}".format(k), v, epoch)
 
+                current_map = test_stats[k][0]
                 if k in best_stat:
-                    if test_stats[k][0] > best_stat[k]:
-                        best_stat["epoch"] = epoch
-                        best_stat[k] = test_stats[k][0]
+                    prev_best = best_stat[k]
+                    if current_map > prev_best + early_stopping_min_delta:
                         improved = True
+                    if current_map > prev_best:
+                        best_stat["epoch"] = epoch
+                        best_stat[k] = current_map
                 else:
+                    prev_best = 0
                     best_stat["epoch"] = epoch
-                    best_stat[k] = test_stats[k][0]
+                    best_stat[k] = current_map
                     improved = True
 
-                if test_stats[k][0] > top1:
-                    best_stat_print["epoch"] = epoch
-                    top1 = test_stats[k][0]
-
+                if current_map > top1:
+                    top1 = current_map
                     if self.output_dir:
                         if stage == 2:
                             dist_utils.save_on_master(self.state_dict(), self.output_dir / "best_stg2.pth")
                         else:
                             dist_utils.save_on_master(self.state_dict(), self.output_dir / "best_stg1.pth")
 
-                best_stat_print[k] = max(best_stat.get(k, 0), top1)
-                print(f"best_stat: {best_stat_print}")
-
             epoch_time = int(time.time() - epoch_start_time)
-            print(f"Finished epoch {epoch + 1} in {epoch_time} seconds")
-
             if improved:
+                print(f"mAP improved in epoch {epoch + 1} ({prev_best:.3f} -> {current_map:.3f}), completed in {epoch_time}s")
                 epochs_without_improvement = 0
             else:
+                print(f"mAP did not improve in epoch {epoch + 1} ({prev_best:.3f} -> {current_map:.3f}), completed in {epoch_time}s")
                 epochs_without_improvement += 1
 
-            if stage == 2:
-                stg2_epoch_count += 1
-
-            # Early stopping check
+            # Early stopping: transition stages or stop training
             if early_stopping_patience > 0 and epochs_without_improvement >= early_stopping_patience:
                 if stage == 1:
-                    print(f"Stage 1 early stopping at epoch {epoch} (no improvement for {early_stopping_patience} epochs)")
+                    print(f"Stage 1 early stopping at epoch {epoch + 1} (no improvement for {early_stopping_patience} epochs)")
                     self._enter_stage2(epoch)
                     stage = 2
-                    stg2_epoch_count = 0
-                    epochs_without_improvement = 0
+                    epochs_without_improvement = -1  # grace epoch for adapting to non-augmented data
                     top1 = 0
                     continue
                 else:
-                    print(f"Stage 2 early stopping at epoch {epoch} (no improvement for {early_stopping_patience} epochs)")
+                    print(f"Stage 2 early stopping at epoch {epoch + 1} (no improvement for {early_stopping_patience} epochs)")
                     break
-
-            # Hard cap on stage 2 epochs
-            if stage == 2 and stg2_epoch_count >= stg2_max_epochs:
-                print(f"Stage 2 reached max epochs ({stg2_max_epochs}) at epoch {epoch}")
-                break
 
             log_stats = {
                 **{f"train_{k}": v for k, v in train_stats.items()},
@@ -202,15 +189,51 @@ class DetSolver(BaseSolver):
         print("Training time {}".format(total_time_str))
 
     def _enter_stage2(self, epoch):
-        """Transition from stage 1 to stage 2: reload best checkpoint, refresh EMA."""
-        print(f"Entering stage 2 at epoch {epoch}")
+        """Transition from stage 1 to stage 2: reload best checkpoint, disable augmentation,
+        unfreeze late backbone, drop LR, refresh EMA."""
+        print(f"Entering stage 2 at epoch {epoch + 1}")
         best_stg1_path = str(self.output_dir / "best_stg1.pth")
         if dist_utils.is_dist_available_and_initialized():
             torch.distributed.barrier()
         self.load_resume_state(best_stg1_path)
+
+        # Disable augmentation for stage 2 refinement
+        self.train_dataloader.collate_fn.stop_epoch = epoch
+        if hasattr(self.train_dataloader.dataset, 'transforms') and \
+                hasattr(self.train_dataloader.dataset.transforms, 'policy'):
+            self.train_dataloader.dataset.transforms.policy["epoch"] = epoch
+
+        # Re-freeze backbone (load_resume_state doesn't restore requires_grad),
+        # then unfreeze late stages for domain adaptation.
+        self._freeze_backbone()
+        self._unfreeze_backbone_late_stages()
+
+        # Drop LR by 10x for fine-grained refinement
+        for pg in self.optimizer.param_groups:
+            pg['lr'] *= 0.1
+        print(f"Stage 2 LR: {[pg['lr'] for pg in self.optimizer.param_groups]}")
+
         if self.ema:
             self.ema.decay = self.train_dataloader.collate_fn.ema_restart_decay
             print(f"Refreshed EMA with decay {self.ema.decay}")
+
+    def _freeze_backbone(self):
+        """Freeze all backbone parameters. They remain in the optimizer but don't compute gradients."""
+        model = dist_utils.de_parallel(self.model)
+        if hasattr(model, 'backbone'):
+            for param in model.backbone.parameters():
+                param.requires_grad = False
+
+    def _unfreeze_backbone_late_stages(self):
+        """Unfreeze the last 2 backbone stages for domain-specific feature adaptation."""
+        model = dist_utils.de_parallel(self.model)
+        if hasattr(model, 'backbone') and hasattr(model.backbone, 'stages'):
+            # HGNetv2 has stages 0-3. Unfreeze stages 2-3 (high-level semantic features).
+            for stage in model.backbone.stages[2:]:
+                for param in stage.parameters():
+                    param.requires_grad = True
+            unfrozen = sum(p.numel() for s in model.backbone.stages[2:] for p in s.parameters() if p.requires_grad)
+            print(f"Unfroze backbone stages 2-3 ({unfrozen:,} params)")
 
     def val(self):
         self.eval()

@@ -117,8 +117,8 @@ def deformable_attention_core_func_v2(
                 sampling_grid_l * torch.tensor([[w, h]], device=value_l.device) + 0.5
             ).to(torch.int64)
 
-            # FIX ME? for rectangle input
-            sampling_coord = sampling_coord.clamp(0, h - 1)
+            sampling_coord[..., 0].clamp_(0, w - 1)
+            sampling_coord[..., 1].clamp_(0, h - 1)
             sampling_coord = sampling_coord.reshape(bs * n_head, Len_q * num_points_list[level], 2)
 
             s_idx = (
