@@ -52,6 +52,65 @@ class HungarianMatcher(nn.Module):
         ), "all costs cant be 0"
 
     @torch.no_grad()
+    def batch_forward(self, outputs_list, targets):
+        """Match multiple output heads (main + aux decoder layers + encoder aux) against the same
+        targets in a single batched pass. All cost matrices are built on the GPU, stacked, then
+        transferred to CPU with a single .cpu() sync before running scipy linear_sum_assignment per
+        (head, image). This replaces N separate matcher.forward() calls — which each triggered their
+        own GPU->CPU sync and stalled the CUDA stream pipeline — with a single sync point, which is
+        a large throughput win on DETR-family detectors where matching is called 8+ times per iter
+        """
+        bs, num_queries = outputs_list[0]["pred_logits"].shape[:2]
+        device = outputs_list[0]["pred_logits"].device
+
+        tgt_ids = torch.cat([v["labels"] for v in targets])
+        tgt_bbox = torch.cat([v["boxes"] for v in targets])
+        sizes = [len(v["boxes"]) for v in targets]
+        tgt_bbox_xyxy = box_cxcywh_to_xyxy(tgt_bbox)
+
+        cost_matrices = []
+        for outputs in outputs_list:
+            if self.use_focal_loss:
+                out_prob = F.sigmoid(outputs["pred_logits"].flatten(0, 1))
+            else:
+                out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)
+            out_bbox = outputs["pred_boxes"].flatten(0, 1)
+
+            if self.use_focal_loss:
+                op = out_prob[:, tgt_ids]
+                neg_cost_class = (
+                    (1 - self.alpha) * (op**self.gamma) * (-(1 - op + 1e-8).log())
+                )
+                pos_cost_class = (
+                    self.alpha * ((1 - op) ** self.gamma) * (-(op + 1e-8).log())
+                )
+                cost_class = pos_cost_class - neg_cost_class
+            else:
+                cost_class = -out_prob[:, tgt_ids]
+
+            cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+            cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), tgt_bbox_xyxy)
+
+            C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+            cost_matrices.append(C.view(bs, num_queries, -1))
+
+        # Single GPU->CPU transfer for all heads at once
+        C_all = torch.stack(cost_matrices, dim=0).cpu()
+        C_all = torch.nan_to_num(C_all, nan=1.0)
+
+        # Run scipy LAP per (head, image); CPU-only work, no further GPU syncs
+        all_indices = []
+        for head_idx in range(len(outputs_list)):
+            C_head = C_all[head_idx]
+            indices_pre = [linear_sum_assignment(c[i]) for i, c in enumerate(C_head.split(sizes, -1))]
+            all_indices.append([
+                (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
+                for i, j in indices_pre
+            ])
+
+        return all_indices
+
+    @torch.no_grad()
     def forward(self, outputs: Dict[str, torch.Tensor], targets, return_topk=False):
         """Performs the matching
 
