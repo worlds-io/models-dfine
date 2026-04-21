@@ -82,12 +82,13 @@ class DetCriterion(torch.nn.Module):
         return batch_idx, tgt_idx
 
     def _get_positive_nums(self, indices):
-        # number of positive samples
+        # number of positive samples — keep as a 0-d GPU tensor so downstream division
+        # (loss / num_pos) stays on-device. Prior .item() forced a sync every criterion call
         num_pos = sum(len(i) for (i, _) in indices)
-        num_pos = torch.as_tensor([num_pos], dtype=torch.float32, device=indices[0][0].device)
+        num_pos = torch.as_tensor(num_pos, dtype=torch.float32, device=indices[0][0].device)
         if dist_utils.is_dist_available_and_initialized():
             torch.distributed.all_reduce(num_pos)
-        num_pos = torch.clamp(num_pos / dist_utils.get_world_size(), min=1).item()
+        num_pos = torch.clamp(num_pos / dist_utils.get_world_size(), min=1)
         return num_pos
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):

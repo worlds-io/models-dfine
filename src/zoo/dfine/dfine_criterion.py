@@ -307,24 +307,27 @@ class DFINECriterion(nn.Module):
             indices_aux_list = cached_indices + cached_indices_enc
             indices_go = self._get_go_indices(indices, indices_aux_list)
 
+            # Keep num_boxes_go as a 0-d GPU tensor — the previous .item() forced a sync
+            # every iter. Downstream code uses it as a divisor (loss / num_boxes), which works
+            # natively on tensors
             num_boxes_go = sum(len(x[0]) for x in indices_go)
             num_boxes_go = torch.as_tensor(
-                [num_boxes_go], dtype=torch.float, device=next(iter(outputs.values())).device
+                num_boxes_go, dtype=torch.float, device=next(iter(outputs.values())).device
             )
             if is_dist_available_and_initialized():
                 torch.distributed.all_reduce(num_boxes_go)
-            num_boxes_go = torch.clamp(num_boxes_go / get_world_size(), min=1).item()
+            num_boxes_go = torch.clamp(num_boxes_go / get_world_size(), min=1)
         else:
             assert "aux_outputs" in outputs, ""
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor(
-            [num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device
+            num_boxes, dtype=torch.float, device=next(iter(outputs.values())).device
         )
         if is_dist_available_and_initialized():
             torch.distributed.all_reduce(num_boxes)
-        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1)
 
         # Compute all the requested losses
         losses = {}
@@ -403,8 +406,9 @@ class DFINECriterion(nn.Module):
         if "dn_outputs" in outputs:
             assert "dn_meta" in outputs, ""
             indices_dn = self.get_cdn_matched_indices(outputs["dn_meta"], targets)
-            dn_num_boxes = num_boxes * outputs["dn_meta"]["dn_num_group"]
-            dn_num_boxes = dn_num_boxes if dn_num_boxes > 0 else 1
+            # num_boxes is now a 0-d tensor (see above), so keep tensor ops here and avoid
+            # Python bool()-on-tensor which would resync
+            dn_num_boxes = torch.clamp(num_boxes * outputs["dn_meta"]["dn_num_group"], min=1)
 
             for i, aux_outputs in enumerate(outputs["dn_outputs"]):
                 aux_outputs["is_dn"] = True
