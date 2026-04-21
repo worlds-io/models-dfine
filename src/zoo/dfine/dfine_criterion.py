@@ -288,22 +288,23 @@ class DFINECriterion(nn.Module):
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if "aux" not in k}
-
-        # Retrieve the matching between the outputs of the last layer and the targets
-        indices = self.matcher(outputs_without_aux, targets)["indices"]
         self._clear_cache()
 
-        # Get the matching union set across all decoder layers.
+        # Batch all matcher calls into a single pass. Originally the main output + ~6
+        # decoder aux outputs + pre_outputs + each encoder aux output each called
+        # self.matcher separately, with each call doing a C.cpu() + scipy LAP (8+ sync
+        # points per iter for D-FINE-M). batch_forward pools all head cost matrices into
+        # one computation — either a single GPU auction pass (DFINE_GPU_MATCHER=1) or a
+        # single .cpu() + scipy loop — eliminating the redundant per-head overhead
         if "aux_outputs" in outputs:
-            indices_aux_list, cached_indices, cached_indices_enc = [], [], []
-            for i, aux_outputs in enumerate(outputs["aux_outputs"] + [outputs["pre_outputs"]]):
-                indices_aux = self.matcher(aux_outputs, targets)["indices"]
-                cached_indices.append(indices_aux)
-                indices_aux_list.append(indices_aux)
-            for i, aux_outputs in enumerate(outputs["enc_aux_outputs"]):
-                indices_enc = self.matcher(aux_outputs, targets)["indices"]
-                cached_indices_enc.append(indices_enc)
-                indices_aux_list.append(indices_enc)
+            aux_plus_pre = outputs["aux_outputs"] + [outputs["pre_outputs"]]
+            enc_aux = outputs["enc_aux_outputs"]
+            all_heads = [outputs_without_aux] + aux_plus_pre + enc_aux
+            all_matched = self.matcher.batch_forward(all_heads, targets)
+            indices = all_matched[0]
+            cached_indices = all_matched[1 : 1 + len(aux_plus_pre)]
+            cached_indices_enc = all_matched[1 + len(aux_plus_pre):]
+            indices_aux_list = cached_indices + cached_indices_enc
             indices_go = self._get_go_indices(indices, indices_aux_list)
 
             num_boxes_go = sum(len(x[0]) for x in indices_go)
