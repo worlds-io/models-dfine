@@ -231,4 +231,7 @@ def evaluate(
         if "segm" in iou_types:
             stats["coco_eval_masks"] = coco_evaluator.coco_eval["segm"].stats.tolist()
 
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return stats, coco_evaluator

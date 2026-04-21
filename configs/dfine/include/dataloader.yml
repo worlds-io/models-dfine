@@ -25,7 +25,7 @@ train_dataloader:
 
   shuffle: True
   total_batch_size: 32 # total batch size equals to 32 (4 * 8)
-  num_workers: 4
+  num_workers: 3
   pin_memory: True
   prefetch_factor: 4
 
