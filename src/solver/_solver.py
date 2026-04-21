@@ -1,5 +1,4 @@
 import atexit
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
@@ -134,15 +133,13 @@ class BaseSolver(object):
             find_unused_parameters=cfg.find_unused_parameters,
         )
 
-        # Compile the backbone and encoder with torch.compile when possible. These two
-        # sub-modules have fully static input shapes during training (image resolution is
-        # fixed after ComputeInputSize, num_queries is constant), so dynamic=False produces
-        # a single fused compiled graph with no recompilation on batch-by-batch variance.
-        # The decoder is skipped because denoising (dn_outputs) injects a variable number of
-        # noised queries per batch, which churns the compile cache. Gated behind
-        # DFINE_COMPILE=1 (default off) so existing runs don't change behavior silently;
-        # flip on once validated
-        if device.type == "cuda" and os.environ.get("DFINE_COMPILE", "0") == "1":
+        # Compile the backbone and encoder with torch.compile. Both sub-modules have fully
+        # static input shapes during training (image resolution is fixed after
+        # ComputeInputSize, num_queries is constant), so dynamic=False produces a single
+        # fused compiled graph with no recompilation on batch-by-batch variance. The
+        # decoder is skipped because denoising (dn_outputs) injects a variable number of
+        # noised queries per batch, which thrashes the compile cache
+        if device.type == "cuda":
             base_model = dist_utils.de_parallel(self.model)
             for sub in ("backbone", "encoder"):
                 if hasattr(base_model, sub):

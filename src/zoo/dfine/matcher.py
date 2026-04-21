@@ -5,7 +5,6 @@ Modules to compute the matching cost and solve the corresponding LSAP.
 Copyright (c) 2024 The D-FINE Authors All Rights Reserved.
 """
 
-import os
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -16,12 +15,6 @@ from scipy.optimize import linear_sum_assignment
 
 from ...core import register
 from .box_ops import box_cxcywh_to_xyxy, generalized_box_iou
-
-# Gated on via DFINE_GPU_MATCHER=1 — replaces the scipy LAP call (which forces a GPU->CPU sync
-# per matcher call, 8+ times per training iter) with a Bertsekas forward auction run entirely
-# on the GPU. Off by default for safety; flip once validated on a long training run
-_GPU_MATCHER = os.environ.get("DFINE_GPU_MATCHER", "0") == "1"
-_GPU_MATCHER_DEBUG = os.environ.get("DFINE_GPU_MATCHER_DEBUG", "0") == "1"
 
 
 @torch.no_grad()
@@ -193,36 +186,6 @@ def _auction_match_from_flat_cost(
     return indices
 
 
-def _assert_lap_parity(
-    C_flat: torch.Tensor,
-    num_queries: int,
-    sizes: List[int],
-    gpu_indices: List[Tuple[torch.Tensor, torch.Tensor]],
-    tol: float = 1e-3,
-) -> None:
-    """Debug helper: run scipy LAP in parallel and assert the matched-cost sums agree with
-    the GPU auction's output within ``tol``. Only runs under DFINE_GPU_MATCHER_DEBUG=1.
-    """
-    bs = len(sizes)
-    C_view = C_flat.view(bs, num_queries, -1).detach().cpu().numpy()
-    offset = 0
-    for i, t in enumerate(sizes):
-        if t == 0:
-            offset += t
-            continue
-        C_i = C_view[i, :, offset : offset + t]
-        row_ind, col_ind = linear_sum_assignment(np.nan_to_num(C_i, nan=1.0))
-        cpu_cost = float(C_i[row_ind, col_ind].sum())
-        rows, cols = gpu_indices[i]
-        gpu_cost = float(C_i[rows.numpy(), cols.numpy()].sum())
-        if abs(cpu_cost - gpu_cost) > tol:
-            raise AssertionError(
-                f"GPU auction LAP parity check failed: image {i} size {t} cpu_cost={cpu_cost:.6f} "
-                f"gpu_cost={gpu_cost:.6f} (tol={tol})"
-            )
-        offset += t
-
-
 @register()
 class HungarianMatcher(nn.Module):
     """This class computes an assignment between the targets and the predictions of the network
@@ -300,7 +263,7 @@ class HungarianMatcher(nn.Module):
             cost_stack.append(C.view(bs, num_queries, -1))
 
         # GPU path: pool all (num_heads * bs) problems into one auction call
-        if _GPU_MATCHER and cost_stack[0].is_cuda and total_T > 0:
+        if cost_stack[0].is_cuda and total_T > 0:
             Tmax = max(sizes)
             NH_bs = num_heads * bs
             device = cost_stack[0].device
@@ -343,11 +306,6 @@ class HungarianMatcher(nn.Module):
                             (torch.as_tensor(row_ind, dtype=torch.long), torch.as_tensor(col_ind, dtype=torch.long))
                         )
                 out.append(head_indices)
-            if _GPU_MATCHER_DEBUG:
-                for h, C in enumerate(cost_stack):
-                    _assert_lap_parity(
-                        C.reshape(bs * num_queries, -1), num_queries, sizes, out[h]
-                    )
             return out
 
         # CPU fallback: single .cpu() transfer for the whole stack, then per-head scipy
@@ -429,14 +387,10 @@ class HungarianMatcher(nn.Module):
         C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
         sizes = [len(v["boxes"]) for v in targets]
 
-        # GPU auction path — eliminates the C.cpu() sync and the scipy LAP. Off by default
-        # behind DFINE_GPU_MATCHER=1 until validated end-to-end. Dead-code get_top_k_matches
-        # still needs the CPU path (return_topk=True), so we only route non-topk calls
-        if _GPU_MATCHER and not return_topk and C.is_cuda:
-            indices = _auction_match_from_flat_cost(C, num_queries, sizes)
-            if _GPU_MATCHER_DEBUG:
-                _assert_lap_parity(C, num_queries, sizes, indices)
-            return {"indices": indices}
+        # GPU auction path — eliminates the C.cpu() sync and the scipy LAP. get_top_k_matches
+        # still needs the CPU path (return_topk=True), so we only route non-topk calls here
+        if not return_topk and C.is_cuda:
+            return {"indices": _auction_match_from_flat_cost(C, num_queries, sizes)}
 
         C = C.view(bs, num_queries, -1).cpu()
 
