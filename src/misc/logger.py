@@ -16,9 +16,22 @@ import torch.distributed as tdist
 from .dist_utils import get_world_size, is_dist_available_and_initialized
 
 
+def _resolve(v):
+    """Resolve a tensor value to a python float, pass other numeric types through."""
+    if isinstance(v, torch.Tensor):
+        return v.item()
+    return float(v)
+
+
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
     window or the global series average.
+
+    Accepts either python scalars or 0-d torch tensors in update(). Tensor values are
+    kept on-device until a summary property is read (median/avg/global_avg/value/max),
+    at which point a single sync happens. This lets the hot training-loop update path
+    stay sync-free — syncs only happen when the MetricLogger actually formats output
+    (every print_freq iters), instead of once per metric per iter
     """
 
     def __init__(self, window_size=20, fmt=None):
@@ -32,7 +45,11 @@ class SmoothedValue(object):
     def update(self, value, n=1):
         self.deque.append(value)
         self.count += n
-        self.total += value * n
+        # total is either a float or a 0-d tensor, depending on what's been fed in
+        if isinstance(value, torch.Tensor):
+            self.total = self.total + value.detach() * n
+        else:
+            self.total = self.total + value * n
 
     def synchronize_between_processes(self):
         """
@@ -40,34 +57,41 @@ class SmoothedValue(object):
         """
         if not is_dist_available_and_initialized():
             return
-        t = torch.tensor([self.count, self.total], dtype=torch.float64, device="cuda")
+        t = torch.tensor([self.count, _resolve(self.total)], dtype=torch.float64, device="cuda")
         tdist.barrier()
         tdist.all_reduce(t)
         t = t.tolist()
         self.count = int(t[0])
         self.total = t[1]
 
+    def _stacked_deque(self):
+        # Build a single 1-D tensor from the deque. When entries are 0-d tensors, torch.stack
+        # keeps the data on-device and we sync once at .median().item(); when entries are
+        # plain floats, torch.tensor builds on CPU as before
+        items = list(self.deque)
+        if items and isinstance(items[0], torch.Tensor):
+            return torch.stack(items)
+        return torch.tensor(items, dtype=torch.float32)
+
     @property
     def median(self):
-        d = torch.tensor(list(self.deque))
-        return d.median().item()
+        return self._stacked_deque().median().item()
 
     @property
     def avg(self):
-        d = torch.tensor(list(self.deque), dtype=torch.float32)
-        return d.mean().item()
+        return self._stacked_deque().float().mean().item()
 
     @property
     def global_avg(self):
-        return self.total / self.count
+        return _resolve(self.total) / self.count
 
     @property
     def max(self):
-        return max(self.deque)
+        return max(_resolve(v) for v in self.deque)
 
     @property
     def value(self):
-        return self.deque[-1]
+        return _resolve(self.deque[-1])
 
     def __str__(self):
         return self.fmt.format(
@@ -156,9 +180,13 @@ class MetricLogger(object):
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
+            # SmoothedValue accepts 0-d tensors directly and defers the .item() sync to
+            # format time. Previously this method forced an .item() per update per metric,
+            # causing 5+ syncs per training iter
             if isinstance(v, torch.Tensor):
-                v = v.item()
-            assert isinstance(v, (float, int))
+                assert v.dim() == 0, f"MetricLogger.update expects scalar tensors, got shape {v.shape} for {k}"
+            else:
+                assert isinstance(v, (float, int))
             self.meters[k].update(v)
 
     def __getattr__(self, attr):

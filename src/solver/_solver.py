@@ -120,6 +120,18 @@ class BaseSolver(object):
         else:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # Kernel-selection / attention-backend tuning. Input shapes are fixed throughout
+        # training (image size locked post-ComputeInputSize, num_queries constant), so
+        # cudnn.benchmark picks the fastest conv kernel per shape once and reuses it.
+        # Enabling the flash + memory-efficient SDPA backends routes nn.MultiheadAttention
+        # and F.scaled_dot_product_attention through fused CUDA kernels when tensor shapes
+        # are compatible, saving 2-5x on attention kernels — which are among the hottest
+        # in D-FINE's decoder
+        if device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+
         self.model = cfg.model
 
         # NOTE: Must load_tuning_state before EMA instance building
