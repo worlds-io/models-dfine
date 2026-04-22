@@ -231,6 +231,19 @@ def evaluate(
         if "segm" in iou_types:
             stats["coco_eval_masks"] = coco_evaluator.coco_eval["segm"].stats.tolist()
 
+        # Release the per-prediction buffers now that we've extracted .stats. Previously the
+        # evaluator held img_ids, eval_imgs, and coco_eval[iou]._evalImgs_cpp (which for 27k
+        # val images is hundreds of MB) until the NEXT evaluate() called cleanup() — a full
+        # epoch of sustained RAM usage for data we already summarized. coco_evaluator.coco_eval
+        # is preserved because the outer solver persists .eval / .stats for checkpoint logging
+        coco_evaluator.img_ids = []
+        coco_evaluator.eval_imgs = {k: [] for k in coco_evaluator.iou_types}
+        for ce in coco_evaluator.coco_eval.values():
+            if hasattr(ce, "_evalImgs_cpp"):
+                ce._evalImgs_cpp = None
+            if hasattr(ce, "evalImgs"):
+                ce.evalImgs = None
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
