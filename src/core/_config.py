@@ -162,6 +162,12 @@ class BaseConfig(object):
     @property
     def val_dataloader(self) -> DataLoader:
         if self._val_dataloader is None and self.val_dataset is not None:
+            # Non-persistent val workers. Val runs once per epoch — when workers persist,
+            # each one holds several GiB of private (COW-broken) pages after its first run
+            # (pycocotools indices, Python heap pages touched during iteration). With 4
+            # workers that's ~8 GiB of RSS that sticks around between epochs, triggering
+            # K8s eviction on constrained pods. Re-forking at each val costs ~10-20s of
+            # startup but releases that memory cleanly when val ends
             loader = DataLoader(
                 self.val_dataset,
                 batch_size=self.val_batch_size,
@@ -169,7 +175,7 @@ class BaseConfig(object):
                 drop_last=False,
                 collate_fn=self.collate_fn,
                 shuffle=self.val_shuffle,
-                persistent_workers=True,
+                persistent_workers=False,
             )
             loader.shuffle = self.val_shuffle
             self._val_dataloader = loader
