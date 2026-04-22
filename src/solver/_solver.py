@@ -145,22 +145,20 @@ class BaseSolver(object):
             find_unused_parameters=cfg.find_unused_parameters,
         )
 
-        # Compile the backbone and encoder with torch.compile(dynamic=True). Multi-scale
-        # training cycles through 13 distinct input resolutions (base_size=640,
-        # base_size_repeat=3 → 480→800 in 32-px steps), which would blow past dynamo's
-        # default recompile_limit=8 with dynamic=False — producing a ~10 min cold start
-        # and partial fallback to eager. dynamic=True lets dynamo specialize on "symbolic
-        # shape varies in the H/W dims" once and reuse the graph across all scales. The
-        # decoder is skipped because (a) denoising injects a variable number of noised
-        # queries per batch, and (b) dynamic=True on the decoder thrashes sympy range
-        # analysis on the 6-layer cascade of refinement heads
+        # Compile the backbone and encoder with torch.compile(dynamic=False). Our training
+        # entrypoint disables multi-scale (base_size_repeat=0 in the Go caller), so input
+        # resolution is fixed at eval_spatial_size for the whole run — one compile, static
+        # specialization. Note the upstream config default is base_size_repeat=3, which
+        # produces 10+ distinct scales per epoch; running with that config would blow past
+        # dynamo's default recompile_limit=8 on this branch. The decoder is skipped because
+        # denoising injects a variable number of noised queries per batch
         if device.type == "cuda":
             base_model = dist_utils.de_parallel(self.model)
             for sub in ("backbone", "encoder"):
                 if hasattr(base_model, sub):
-                    compiled = torch.compile(getattr(base_model, sub), dynamic=True)
+                    compiled = torch.compile(getattr(base_model, sub), dynamic=False)
                     setattr(base_model, sub, compiled)
-                    print(f"Compiled DFINE.{sub} with torch.compile(dynamic=True)")
+                    print(f"Compiled DFINE.{sub} with torch.compile(dynamic=False)")
 
         self.criterion = self.to(cfg.criterion, device)
         self.postprocessor = self.to(cfg.postprocessor, device)
