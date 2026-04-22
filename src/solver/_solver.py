@@ -145,19 +145,22 @@ class BaseSolver(object):
             find_unused_parameters=cfg.find_unused_parameters,
         )
 
-        # Compile the backbone and encoder with torch.compile. Both sub-modules have fully
-        # static input shapes during training (image resolution is fixed after
-        # ComputeInputSize, num_queries is constant), so dynamic=False produces a single
-        # fused compiled graph with no recompilation on batch-by-batch variance. The
-        # decoder is skipped because denoising (dn_outputs) injects a variable number of
-        # noised queries per batch, which thrashes the compile cache
+        # Compile the backbone and encoder with torch.compile(dynamic=True). Multi-scale
+        # training cycles through 13 distinct input resolutions (base_size=640,
+        # base_size_repeat=3 → 480→800 in 32-px steps), which would blow past dynamo's
+        # default recompile_limit=8 with dynamic=False — producing a ~10 min cold start
+        # and partial fallback to eager. dynamic=True lets dynamo specialize on "symbolic
+        # shape varies in the H/W dims" once and reuse the graph across all scales. The
+        # decoder is skipped because (a) denoising injects a variable number of noised
+        # queries per batch, and (b) dynamic=True on the decoder thrashes sympy range
+        # analysis on the 6-layer cascade of refinement heads
         if device.type == "cuda":
             base_model = dist_utils.de_parallel(self.model)
             for sub in ("backbone", "encoder"):
                 if hasattr(base_model, sub):
-                    compiled = torch.compile(getattr(base_model, sub), dynamic=False)
+                    compiled = torch.compile(getattr(base_model, sub), dynamic=True)
                     setattr(base_model, sub, compiled)
-                    print(f"Compiled DFINE.{sub} with torch.compile(dynamic=False)")
+                    print(f"Compiled DFINE.{sub} with torch.compile(dynamic=True)")
 
         self.criterion = self.to(cfg.criterion, device)
         self.postprocessor = self.to(cfg.postprocessor, device)
