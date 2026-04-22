@@ -145,32 +145,6 @@ class BaseSolver(object):
             find_unused_parameters=cfg.find_unused_parameters,
         )
 
-        # Compile the backbone and encoder with torch.compile(dynamic=False) when input
-        # resolution is static. Our training entrypoint disables multi-scale
-        # (base_size_repeat=0 in the Go caller), so one compile + static specialization is
-        # correct. If someone runs with the upstream config default (base_size_repeat=3 →
-        # 10+ distinct scales per epoch), compile would blow past dynamo's default
-        # recompile_limit=8 — so we auto-skip there. Read base_size_repeat from the raw
-        # YAML rather than the instantiated collate_fn to avoid constructing the
-        # dataloader this early. Decoder is never compiled — dn_outputs injects a
-        # variable number of noised queries per batch
-        collate_cfg = cfg.yaml_cfg.get("train_dataloader", {}).get("collate_fn", {})
-        multi_scale_on = int(collate_cfg.get("base_size_repeat", 0)) > 0
-        if device.type == "cuda" and not multi_scale_on:
-            base_model = dist_utils.de_parallel(self.model)
-            for sub in ("backbone", "encoder"):
-                if hasattr(base_model, sub):
-                    compiled = torch.compile(getattr(base_model, sub), dynamic=False)
-                    setattr(base_model, sub, compiled)
-                    if dist_utils.is_main_process():
-                        print(f"Compiled DFINE.{sub} with torch.compile(dynamic=False)")
-        elif device.type == "cuda" and multi_scale_on and dist_utils.is_main_process():
-            print(
-                "Skipping torch.compile: multi-scale training is enabled "
-                f"(base_size_repeat={collate_cfg.get('base_size_repeat')}); "
-                "dynamic=False would thrash the compile cache"
-            )
-
         self.criterion = self.to(cfg.criterion, device)
         self.postprocessor = self.to(cfg.postprocessor, device)
 
