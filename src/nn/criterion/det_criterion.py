@@ -59,7 +59,7 @@ class DetCriterion(torch.nn.Module):
         matched = self.matcher(outputs, targets)
         values = matched["values"]
         indices = matched["indices"]
-        num_boxes = self._get_positive_nums(indices)
+        num_boxes = self._get_positive_nums(indices, outputs["pred_logits"].device)
 
         # Compute all the requested losses
         losses = {}
@@ -81,13 +81,16 @@ class DetCriterion(torch.nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
-    def _get_positive_nums(self, indices):
-        # number of positive samples
+    def _get_positive_nums(self, indices, device):
+        # number of positive samples — keep as a 0-d tensor on the same device as the model
+        # outputs so downstream division (loss / num_pos) stays on-device without a scalar
+        # readback. Indices come back from the matcher on CPU regardless of matching path, so
+        # we can't use their device here
         num_pos = sum(len(i) for (i, _) in indices)
-        num_pos = torch.as_tensor([num_pos], dtype=torch.float32, device=indices[0][0].device)
+        num_pos = torch.as_tensor(num_pos, dtype=torch.float32, device=device)
         if dist_utils.is_dist_available_and_initialized():
             torch.distributed.all_reduce(num_pos)
-        num_pos = torch.clamp(num_pos / dist_utils.get_world_size(), min=1).item()
+        num_pos = torch.clamp(num_pos / dist_utils.get_world_size(), min=1)
         return num_pos
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):

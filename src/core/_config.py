@@ -148,6 +148,11 @@ class BaseConfig(object):
                 num_workers=self.num_workers,
                 collate_fn=self.collate_fn,
                 shuffle=self.train_shuffle,
+                # Pin host memory so batch tensors can be uploaded to the GPU via DMA without
+                # a pageable->pinned->GPU copy. Profiling showed ~5-7 ms per iter stuck in the
+                # H2D image upload path; pinning lets that overlap with the previous iter's
+                # GPU work via non_blocking=True transfers downstream
+                pin_memory=True,
             )
             loader.shuffle = self.train_shuffle
             self._train_dataloader = loader

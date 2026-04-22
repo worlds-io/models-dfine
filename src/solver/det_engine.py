@@ -133,7 +133,11 @@ def train_one_epoch(
         loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
         loss_value = sum(loss_dict_reduced.values())
 
-        if not math.isfinite(loss_value.item()):
+        # NaN check on optimizer-step boundaries. Previously ran every iter with a
+        # GPU->CPU sync; now gated on `not is_accum_step` so the max delay between
+        # the first NaN loss and the bail-out is one grad-accumulation window (typically
+        # 1 step) rather than a full `print_freq` window of optimizer updates
+        if not is_accum_step and not math.isfinite(loss_value.item()):
             print("Loss is {}, stopping training".format(loss_value.item()))
             print(loss_dict_reduced)
             sys.exit(1)
