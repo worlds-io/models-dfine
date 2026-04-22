@@ -12,25 +12,42 @@ from ..core import register
 __all__ = ["AdamW", "SGD", "Adam", "MultiStepLR", "CosineAnnealingLR", "OneCycleLR", "LambdaLR"]
 
 
+def _params_are_cuda(params) -> bool:
+    """True iff every tensor in the param groups is on CUDA. Fused optimizers require all
+    params be on the same CUDA device, so a mixed-device model must opt out."""
+    params = list(params)
+    if not params:
+        return False
+    tensors = []
+    for p in params:
+        if isinstance(p, dict):
+            tensors.extend(p.get("params", []))
+        else:
+            tensors.append(p)
+    return bool(tensors) and all(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors)
+
+
 class Adam(optim.Adam):
-    """Adam that defaults to fused=True on CUDA. Fused optimizers collapse N per-parameter
-    update kernels into a single kernel, which matters because kernel-launch dispatch is a
+    """Adam that defaults to fused=True when all params are on CUDA. Fused optimizers collapse
+    N per-parameter update kernels into one, which matters because kernel-launch dispatch is a
     dominant per-iter cost on transformer models like D-FINE (Nsight profiling shows ~9.5k
     kernel launches per training iter, median 15us gap between them).
     """
 
     def __init__(self, params, *args, fused=None, **kwargs):
+        params = list(params)
         if fused is None:
-            fused = torch.cuda.is_available()
+            fused = _params_are_cuda(params)
         super().__init__(params, *args, fused=fused, **kwargs)
 
 
 class AdamW(optim.AdamW):
-    """AdamW that defaults to fused=True on CUDA. See Adam above for rationale."""
+    """AdamW that defaults to fused=True when all params are on CUDA. See Adam above."""
 
     def __init__(self, params, *args, fused=None, **kwargs):
+        params = list(params)
         if fused is None:
-            fused = torch.cuda.is_available()
+            fused = _params_are_cuda(params)
         super().__init__(params, *args, fused=fused, **kwargs)
 
 

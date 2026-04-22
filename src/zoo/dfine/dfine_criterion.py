@@ -294,8 +294,9 @@ class DFINECriterion(nn.Module):
         # decoder aux outputs + pre_outputs + each encoder aux output each called
         # self.matcher separately, with each call doing a C.cpu() + scipy LAP (8+ sync
         # points per iter for D-FINE-M). batch_forward pools all head cost matrices into
-        # one computation — either a single GPU auction pass (DFINE_GPU_MATCHER=1) or a
-        # single .cpu() + scipy loop — eliminating the redundant per-head overhead
+        # one computation — the GPU auction matcher runs automatically when the cost
+        # matrix is on CUDA, otherwise a single .cpu() + scipy loop — eliminating the
+        # redundant per-head overhead
         if "aux_outputs" in outputs:
             aux_plus_pre = outputs["aux_outputs"] + [outputs["pre_outputs"]]
             enc_aux = outputs["enc_aux_outputs"]

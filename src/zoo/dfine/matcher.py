@@ -32,9 +32,11 @@ def _gpu_auction_lap(
     (satisfied by DETR's num_queries >= num_targets).
 
     Uses a single tight epsilon = tol/(Tmax+1) so the produced assignment's total cost is
-    within `tol` of scipy's. Fully vectorized updates — no ``torch.nonzero`` or per-iter
-    ``.any()`` calls that would trigger GPU->CPU syncs. Early-exit is probed only every
-    ``sync_check_every`` iterations to amortize the single required bool sync.
+    within `tol` of scipy's. Fully vectorized updates — no ``torch.nonzero`` per-iter — but
+    the early-exit probe does call ``.any()`` on the GPU each iteration, which syncs.
+    ``sync_check_every`` defaults to 1 because bakeoffs showed the per-iter sync cost to be
+    negligible vs. the cost of running a few extra rounds past convergence; raise it if you
+    need to amortize further.
 
     Args:
         cost: [B, Q, Tmax] float32 cost tensor.
@@ -67,7 +69,6 @@ def _gpu_auction_lap(
 
     price = torch.zeros(B, Q, device=device, dtype=dtype)
     obj_of_person = torch.full((B, Tmax), -1, dtype=torch.long, device=device)
-    person_of_obj = torch.full((B, Q), -1, dtype=torch.long, device=device)
 
     max_iters = min(max_iters_factor * max(Tmax, 1) + 64, 50000)
 
@@ -121,7 +122,6 @@ def _gpu_auction_lap(
             best_obj,
             torch.where(was_displaced, obj_of_person.new_full((1,), UNASSIGNED), obj_of_person),
         )
-        person_of_obj = torch.where(has_winner, winner_per_obj, person_of_obj)
 
         bid_add = torch.where(has_winner, bid_buf, bid_buf.new_zeros(()))
         price = price + bid_add

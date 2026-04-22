@@ -7,12 +7,11 @@ so we check total cost, not index equality).
 Skipped when CUDA is unavailable — the auction kernel is GPU-only.
 
 Run:
-    pytest models/models-dfine/tests/test_gpu_auction_lap.py -q
+    pytest tests/test_gpu_auction_lap.py -q
 """
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -23,7 +22,7 @@ from scipy.optimize import linear_sum_assignment
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.zoo.dfine.matcher import _auction_match_from_flat_cost, _gpu_auction_lap  # noqa: E402
+from src.zoo.dfine.matcher import _auction_match_from_flat_cost  # noqa: E402
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU auction requires CUDA")
