@@ -238,6 +238,15 @@ class HungarianMatcher(nn.Module):
         tgt_bbox = torch.cat([v["boxes"] for v in targets])
         sizes = [len(v["boxes"]) for v in targets]
         total_T = tgt_bbox.shape[0]
+
+        # Batch with zero targets across every image: skip cost construction and return
+        # per-head per-image empty CPU index pairs. Matches the early-return in
+        # _auction_match_from_flat_cost() and avoids both a pointless GPU->CPU transfer and
+        # a scipy call on Q×0 matrices
+        if total_T == 0:
+            empty = torch.empty(0, dtype=torch.int64)
+            return [[(empty.clone(), empty.clone()) for _ in range(bs)] for _ in range(num_heads)]
+
         tgt_bbox_xyxy = box_cxcywh_to_xyxy(tgt_bbox)
 
         # Build a stack of cost matrices on GPU: [num_heads, bs, Q, total_T]
