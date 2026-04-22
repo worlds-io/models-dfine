@@ -59,8 +59,13 @@ class BaseConfig(object):
         self.resume: str = None
         self.tuning: str = None
 
-        self.epochs: int = None
-        self.last_epoch: int = -1
+        # Step-based training. Wall-clock is tied to `max_steps` rather than a number of
+        # passes over the dataset — this makes schedules (warmup, cosine) and budgets
+        # meaningful across dataset sizes that can vary 50x+ in practice. See det_solver.fit
+        self.max_steps: int = None
+        self.eval_every_steps: int = None  # cadence of validation + early-stop check
+        self.checkpoint_every_steps: int = None  # cadence of `last.pth` checkpoint writes
+        self.last_step: int = -1  # used for resume
 
         self.use_amp: bool = False
         self.use_ema: bool = False
@@ -72,12 +77,13 @@ class BaseConfig(object):
 
         self.seed: int = None
         self.print_freq: int = None
-        self.checkpoint_freq: int = 1
         self.output_dir: str = None
         self.summary_dir: str = None
         self.device: str = ""
 
         # finetuning
+        # Expressed in units of eval intervals (i.e. how many back-to-back evals without
+        # improvement before we early-stop / transition stages).
         self.early_stopping_patience: int = 0
         self.early_stopping_min_delta: float = 0
         self.gradient_accumulation_steps: int = 1

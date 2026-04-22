@@ -140,7 +140,7 @@ class BaseSolver(object):
         self.scaler = cfg.scaler
 
         self.device = device
-        self.last_epoch = self.cfg.last_epoch
+        self.last_step = self.cfg.last_step
 
         self.output_dir = Path(cfg.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -204,7 +204,7 @@ class BaseSolver(object):
         state["date"] = datetime.now().isoformat()
 
         # For resume
-        state["last_epoch"] = self.last_epoch
+        state["last_step"] = self.last_step
 
         for k, v in self.__dict__.items():
             if hasattr(v, "state_dict"):
@@ -215,8 +215,13 @@ class BaseSolver(object):
 
     def load_state_dict(self, state):
         """Load state dict, train/eval"""
-        if "last_epoch" in state:
-            self.last_epoch = state["last_epoch"]
+        # Accept both `last_step` (new, step-based) and `last_epoch` (legacy) keys so old
+        # checkpoints remain loadable — legacy ones just pin last_step to -1 which
+        # effectively means "start from scratch" as far as the solver loop is concerned
+        if "last_step" in state:
+            self.last_step = state["last_step"]
+        elif "last_epoch" in state:
+            self.last_step = -1
 
         for k, v in self.__dict__.items():
             if hasattr(v, "load_state_dict") and k in state:
