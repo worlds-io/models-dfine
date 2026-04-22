@@ -65,13 +65,23 @@ class SmoothedValue(object):
         self.total = t[1]
 
     def _stacked_deque(self):
-        # Build a single 1-D tensor from the deque. When entries are 0-d tensors, torch.stack
-        # keeps the data on-device and we sync once at .median().item(); when entries are
-        # plain floats, torch.tensor builds on CPU as before
+        # Build a single 1-D tensor from the deque. A deque of plain Python floats stays on
+        # CPU as before. When any entry is a 0-d tensor we pick a single target device (any
+        # CUDA tensor wins over CPU — the whole point is to defer device->host sync until the
+        # summary property runs .item()), normalize every entry to that device, then stack.
+        # Mixed float/tensor deques are handled so the docstring's either-or contract holds
         items = list(self.deque)
-        if items and isinstance(items[0], torch.Tensor):
-            return torch.stack(items)
-        return torch.tensor(items, dtype=torch.float32)
+        if not items:
+            return torch.tensor([], dtype=torch.float32)
+        tensor_items = [v for v in items if isinstance(v, torch.Tensor)]
+        if not tensor_items:
+            return torch.tensor(items, dtype=torch.float32)
+        device = next((t.device for t in tensor_items if t.is_cuda), tensor_items[0].device)
+        return torch.stack([
+            v.detach().to(device) if isinstance(v, torch.Tensor)
+            else torch.tensor(v, dtype=torch.float32, device=device)
+            for v in items
+        ])
 
     @property
     def median(self):

@@ -13,8 +13,9 @@ __all__ = ["AdamW", "SGD", "Adam", "MultiStepLR", "CosineAnnealingLR", "OneCycle
 
 
 def _params_are_cuda(params) -> bool:
-    """True iff every tensor in the param groups is on CUDA. Fused optimizers require all
-    params be on the same CUDA device, so a mixed-device model must opt out."""
+    """True iff every tensor in the param groups is on CUDA *and* they all share a single
+    device. Fused optimizers require same-device params; a model sharded across cuda:0 and
+    cuda:1 must opt out."""
     params = list(params)
     if not params:
         return False
@@ -24,7 +25,9 @@ def _params_are_cuda(params) -> bool:
             tensors.extend(p.get("params", []))
         else:
             tensors.append(p)
-    return bool(tensors) and all(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors)
+    if not tensors or not all(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors):
+        return False
+    return len({t.device for t in tensors}) == 1
 
 
 class Adam(optim.Adam):
