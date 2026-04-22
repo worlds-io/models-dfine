@@ -25,6 +25,20 @@ from ..optim import ModelEMA, Warmup
 from .validator import Validator, scale_boxes
 
 
+def _release_allocator_arenas() -> None:
+    """Tell glibc to return empty arenas to the OS. CPython + glibc keep freed memory in
+    per-thread arenas indefinitely unless explicitly told to trim; without this call, each
+    val run leaves multi-GB of "free but not returned" memory in the process, which
+    eventually trips k8s eviction. Requires PYTHONMALLOC=malloc in the pod env for Python's
+    small-object allocations to go through glibc (otherwise they stay in obmalloc pools
+    which are not trimmable)."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     criterion: torch.nn.Module,
@@ -189,21 +203,29 @@ def evaluate(
 
     output_dir = kwargs.get("output_dir", None)
 
+    # Accumulate raw predictions, then run a single coco_evaluator.update() at the end.
+    # The library's per-batch update() pattern runs coco_eval.evaluate() inside every call
+    # and appends a per-(cat × area × batch_size) numpy array of C++ eval wrappers to
+    # eval_imgs[iou] — at production scale (27k val images, 80 cats, 4 areas, bs 16) that
+    # accumulates >8M wrappers over the val loop, allocated into the process heap and never
+    # returned until the val ends. A single end-of-loop update() converts per-batch growth
+    # into one end-of-val peak with the same total wrappers but a much shorter residency
+    all_predictions: Dict = {}
     for samples, targets in data_loader:
         samples = samples.to(device, non_blocking=True)
         targets = [{k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
 
         outputs = model(samples)
-
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
-
         results = postprocessor(outputs, orig_target_sizes)
 
-        res = {target["image_id"].item(): output for target, output in zip(targets, results)}
-        if coco_evaluator is not None:
-            coco_evaluator.update(res)
+        for target, output in zip(targets, results):
+            img_id = target["image_id"].item()
+            all_predictions[img_id] = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                                        for k, v in output.items()}
 
-    if coco_evaluator is not None:
+    if coco_evaluator is not None and all_predictions:
+        coco_evaluator.update(all_predictions)
         coco_evaluator.synchronize_between_processes()
         coco_evaluator.accumulate()
         # summarize() populates .stats — suppress its verbose table
@@ -235,11 +257,17 @@ def evaluate(
         if "segm" in iou_types:
             stats["coco_eval_masks"] = coco_evaluator.coco_eval["segm"].stats.tolist()
 
-        # Release the per-prediction buffers now that we've extracted .stats. Previously the
-        # evaluator held img_ids, eval_imgs, and coco_eval[iou]._evalImgs_cpp (which for 27k
-        # val images is hundreds of MB) until the NEXT evaluate() called cleanup() — a full
-        # epoch of sustained RAM usage for data we already summarized. coco_evaluator.coco_eval
-        # is preserved because the outer solver persists .eval / .stats for checkpoint logging
+        # Aggressively release per-val state. The critical retained buffers:
+        #   - eval_imgs[iou]: list of per-batch np.array(_evalImgs_cpp) arrays, one per
+        #     update() call — O(N_batches × cats × areas × bs) wrappers
+        #   - coco_eval[iou]._evalImgs_cpp: merged eval buffer after synchronize
+        #   - coco_eval[iou].gt_dataset / .dt_dataset: C++ datasets holding per-annotation
+        #     Python-wrapped instances (NOT cleared by library until next _prepare() call)
+        #   - coco_eval[iou].ious: dict of per-(imgId, catId) IoU ndarrays
+        #   - coco_eval[iou].cocoDt: last batch's detection COCO object
+        #   - coco_eval[iou]._paramsEval: deepcopy of params from last update
+        # coco_eval itself is preserved so the solver can read .stats; the structures that
+        # don't contribute to stats are all released here
         coco_evaluator.img_ids = []
         coco_evaluator.eval_imgs = {k: [] for k in coco_evaluator.iou_types}
         for ce in coco_evaluator.coco_eval.values():
@@ -247,8 +275,16 @@ def evaluate(
                 ce._evalImgs_cpp = None
             if hasattr(ce, "evalImgs"):
                 ce.evalImgs = None
+            if hasattr(ce, "gt_dataset") and hasattr(ce.gt_dataset, "clean"):
+                ce.gt_dataset.clean()
+            if hasattr(ce, "dt_dataset") and hasattr(ce.dt_dataset, "clean"):
+                ce.dt_dataset.clean()
+            ce.ious = {}
+            ce.cocoDt = None
+            ce._paramsEval = None
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    _release_allocator_arenas()
 
     return stats, coco_evaluator

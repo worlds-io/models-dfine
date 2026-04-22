@@ -185,12 +185,11 @@ class DetSolver(BaseSolver):
                                 self.output_dir / "eval" / name,
                             )
 
-            # Explicit gc.collect() at the end of each epoch. CPython's reference-counted GC
-            # releases most objects eagerly, but reference cycles (common in autograd graphs
-            # and wrapper objects) only get collected by the generational collector — which
-            # may not run often enough on long-lived training processes. Forcing a full
-            # collection here ensures any cyclic garbage from the epoch's iterations is
-            # freed before the next epoch starts. Small CPU cost, defense in depth
+            # Explicit gc.collect() at the end of each epoch — cyclic garbage from autograd
+            # wrappers, etc. The end-of-evaluate() malloc_trim in det_engine.py returns
+            # freed glibc arenas to the OS; without it the ~6 GB of eval-phase transient
+            # allocations sit in the process heap until the next val rewrites them and
+            # trigger k8s eviction long before the actual limit
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
