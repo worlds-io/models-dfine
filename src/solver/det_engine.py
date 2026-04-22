@@ -133,11 +133,11 @@ def train_one_epoch(
         loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
         loss_value = sum(loss_dict_reduced.values())
 
-        # NaN check: previously ran every iter, forcing a GPU->CPU sync per iter. Bail-out
-        # needs to happen eventually, but catching a NaN within ~print_freq iters is fine
-        # (the optimizer step for that batch has already happened either way). Tie to
-        # print_freq so the sync happens on an iter we're already syncing for the logger
-        if (i + 1) % print_freq == 0 and not math.isfinite(loss_value.item()):
+        # NaN check on optimizer-step boundaries. Previously ran every iter with a
+        # GPU->CPU sync; now gated on `not is_accum_step` so the max delay between
+        # the first NaN loss and the bail-out is one grad-accumulation window (typically
+        # 1 step) rather than a full `print_freq` window of optimizer updates
+        if not is_accum_step and not math.isfinite(loss_value.item()):
             print("Loss is {}, stopping training".format(loss_value.item()))
             print(loss_dict_reduced)
             sys.exit(1)
