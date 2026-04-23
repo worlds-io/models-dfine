@@ -50,6 +50,20 @@ class CocoDetection(FasterCocoDetection, DetDataset):
         image, target = super(FasterCocoDetection, self).__getitem__(idx)
         image_id = self.ids[idx]
         image_path = os.path.join(self.img_folder, self.coco.loadImgs(image_id)[0]["file_name"])
+
+        # Drop this image's pages from the kernel page cache. PIL/torchvision just read
+        # the whole file in super().__getitem__() and left the bytes in cgroup-accounted
+        # page cache; without this, the sum of all touched images (~dataset size) sits in
+        # `active_file` and pushes the pod's WSS toward its limit. With shuffle=True +
+        # multi-epoch training each image gets re-read anyway, so caching buys little.
+        # fadvise on a freshly reopened fd tells the kernel to invalidate that file's
+        # pages; errors (fs doesn't support fadvise, race with close, etc.) are ignored
+        try:
+            with open(image_path, "rb") as _f:
+                os.posix_fadvise(_f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        except (AttributeError, OSError):
+            pass
+
         target = {"image_id": image_id, "image_path": image_path, "annotations": target}
 
         if self.remap_mscoco_category:
