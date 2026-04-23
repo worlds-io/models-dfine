@@ -5,8 +5,6 @@ Modules to compute the matching cost and solve the corresponding LSAP.
 Copyright (c) 2024 The D-FINE Authors All Rights Reserved.
 """
 
-import os
-from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -17,22 +15,6 @@ from scipy.optimize import linear_sum_assignment
 
 from ...core import register
 from .box_ops import box_cxcywh_to_xyxy, generalized_box_iou
-
-
-# Persistent thread pool for parallel scipy.linear_sum_assignment calls.
-# scipy's LAP is implemented in C and releases the GIL, so threads deliver real concurrency.
-# Sized to fill the CPU without over-subscribing threads that compete with the dataloader
-# workers for CPU time.
-_LAP_POOL_WORKERS = max(1, min((os.cpu_count() or 4) - 2, 8))
-_LAP_POOL = ThreadPoolExecutor(max_workers=_LAP_POOL_WORKERS, thread_name_prefix="lap")
-
-
-def _lap_one(args: Tuple[int, np.ndarray]) -> Tuple[int, np.ndarray, np.ndarray]:
-    """Solve a single LAP instance. Returns (task_id, row_ind, col_ind) so the caller can
-    reassemble results in order without relying on submission order."""
-    task_id, C = args
-    row_ind, col_ind = linear_sum_assignment(C)
-    return task_id, row_ind, col_ind
 
 
 @register()
@@ -120,49 +102,25 @@ class HungarianMatcher(nn.Module):
             C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
             cost_stack.append(C.view(bs, num_queries, -1))
 
-        # Single .cpu() transfer for the whole stack, then run each per-(head, image) LAP
-        # concurrently through a thread pool. scipy.linear_sum_assignment releases the GIL,
-        # so the threads deliver real parallelism (not pseudo-parallelism gated by the GIL).
-        # The .cpu() is a blocking transfer — the main thread can't start the first LAP
-        # until the GPU forward pass has produced the cost matrices — but from that point
-        # on, running num_heads × bs problems in parallel instead of sequentially is a
-        # direct wall-clock win proportional to min(num_heads × bs, pool_size).
+        # Single .cpu() transfer for the whole stack, then per-(head, image) scipy LAP.
+        # Thread-pool parallelism was tried and measured slower: scipy's C solve on a 50×25
+        # matrix runs in ~50µs, which is below the ThreadPoolExecutor dispatch overhead
+        # even with chunked batching. Sequential on the main thread wins for problem sizes
+        # in this range
         cost_all_cpu = torch.stack(cost_stack, dim=0).cpu()
-        cost_all_cpu = torch.nan_to_num(cost_all_cpu, nan=1.0).numpy()
-
-        # Build a flat task list with deterministic task_ids so we can reassemble
-        # results in order regardless of completion order. Each split chunk has shape
-        # [bs, Q, sizes[i]]; we select row `i` to get image `i`'s own cost matrix.
-        tasks: List[Tuple[int, np.ndarray]] = []
-        for h in range(num_heads):
-            per_head_chunks = np.split(cost_all_cpu[h], np.cumsum(sizes)[:-1], axis=-1)
-            for i, chunk in enumerate(per_head_chunks):
-                if sizes[i] > 0:
-                    task_id = h * bs + i
-                    tasks.append((task_id, chunk[i]))
-
-        # Submit all LAP problems to the shared thread pool. executor.map preserves the
-        # iteration order of results, so we can zip them back with the (h, i) pairs
-        results: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
-        for task_id, row_ind, col_ind in _LAP_POOL.map(_lap_one, tasks):
-            results[task_id] = (row_ind, col_ind)
-
-        # Reassemble per-head per-image index pairs, filling in empties for zero-target imgs
+        cost_all_cpu = torch.nan_to_num(cost_all_cpu, nan=1.0)
         out: List[List[Tuple[torch.Tensor, torch.Tensor]]] = []
-        empty = torch.empty(0, dtype=torch.int64)
         for h in range(num_heads):
-            head_indices: List[Tuple[torch.Tensor, torch.Tensor]] = []
-            for i in range(bs):
-                task_id = h * bs + i
-                if task_id not in results:
-                    head_indices.append((empty.clone(), empty.clone()))
-                else:
-                    row_ind, col_ind = results[task_id]
-                    head_indices.append((
-                        torch.as_tensor(row_ind, dtype=torch.int64),
-                        torch.as_tensor(col_ind, dtype=torch.int64),
-                    ))
-            out.append(head_indices)
+            indices_pre = [
+                linear_sum_assignment(c[i])
+                for i, c in enumerate(cost_all_cpu[h].split(sizes, -1))
+            ]
+            out.append(
+                [
+                    (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
+                    for i, j in indices_pre
+                ]
+            )
         return out
 
     @torch.no_grad()
@@ -229,31 +187,11 @@ class HungarianMatcher(nn.Module):
 
         C = C.view(bs, num_queries, -1).cpu()
         C = torch.nan_to_num(C, nan=1.0)
-
-        if return_topk:
-            # get_top_k_matches does multiple rounds of scipy on the same cost matrices and
-            # needs the full C tensor for in-place masking between rounds, so keep this
-            # single-threaded.
-            indices_pre = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
-            indices = [
-                (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
-                for i, j in indices_pre
-            ]
-        else:
-            # Parallel scipy via the shared thread pool — same GIL-release trick as
-            # batch_forward. Single-head has only bs problems (vs num_heads × bs in
-            # batch_forward), so the win here is smaller but still real.
-            chunks = list(C.split(sizes, -1))
-            tasks = [(i, chunks[i][i].numpy()) for i in range(bs) if sizes[i] > 0]
-            results: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
-            for task_id, row_ind, col_ind in _LAP_POOL.map(_lap_one, tasks):
-                results[task_id] = (row_ind, col_ind)
-            empty_np = np.empty(0, dtype=np.int64)
-            indices_pre = [results.get(i, (empty_np, empty_np)) for i in range(bs)]
-            indices = [
-                (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
-                for i, j in indices_pre
-            ]
+        indices_pre = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
+        indices = [
+            (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
+            for i, j in indices_pre
+        ]
 
         # Compute topk indices
         if return_topk:
