@@ -82,6 +82,12 @@ class BaseConfig(object):
         self.early_stopping_min_delta: float = 0
         self.gradient_accumulation_steps: int = 1
 
+        # Cap on val-set size per eval. Full val loops accumulate predictions for every
+        # image into one dict before CocoEvaluator.update() runs; with shuffle=True on
+        # the val loader, a cap makes each epoch's eval a different random subset and
+        # keeps the end-of-epoch memory spike bounded. 0 = no cap (full val).
+        self.max_val_images: int = 0
+
     @property
     def model(self) -> nn.Module:
         return self._model

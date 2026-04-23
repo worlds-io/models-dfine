@@ -25,9 +25,9 @@ train_dataloader:
 
   shuffle: True
   total_batch_size: 32 # total batch size equals to 32 (4 * 8)
-  num_workers: 3
+  num_workers: 2
   pin_memory: True
-  prefetch_factor: 4
+  prefetch_factor: 2
 
 
 val_dataloader:
@@ -36,9 +36,12 @@ val_dataloader:
       ops:
         - {type: Resize, size: [640, 640], }
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
-  shuffle: False
+  # shuffle=True so the `max_val_images` cap (set from the trainer via -u) samples a
+  # different random subset each epoch. Without shuffle the cap would always evaluate
+  # the same first-N images of the val split
+  shuffle: True
   total_batch_size: 64
-  num_workers: 2
+  num_workers: 1
   pin_memory: True
   persistent_workers: False
-  prefetch_factor: 4
+  prefetch_factor: 2

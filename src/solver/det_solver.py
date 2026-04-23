@@ -47,6 +47,7 @@ class DetSolver(BaseSolver):
                 self.device,
                 self.last_epoch,
                 False,
+                max_val_images=args.max_val_images,
             )
             for k in test_stats:
                 best_stat["epoch"] = self.last_epoch
@@ -108,6 +109,7 @@ class DetSolver(BaseSolver):
                 epoch,
                 False,
                 output_dir=self.output_dir,
+                max_val_images=args.max_val_images,
             )
 
             # Track improvement for early stopping.
@@ -258,6 +260,7 @@ class DetSolver(BaseSolver):
             self.device,
             epoch=-1,
             use_wandb=False,
+            max_val_images=self.cfg.max_val_images,
         )
 
         if self.output_dir:

@@ -202,6 +202,7 @@ def evaluate(
     # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
 
     output_dir = kwargs.get("output_dir", None)
+    max_val_images = kwargs.get("max_val_images", 0) or 0
 
     # Accumulate raw predictions, then run a single coco_evaluator.update() at the end.
     # The library's per-batch update() pattern runs coco_eval.evaluate() inside every call
@@ -224,7 +225,19 @@ def evaluate(
             all_predictions[img_id] = {k: v.cpu() if isinstance(v, torch.Tensor) else v
                                         for k, v in output.items()}
 
+        if max_val_images > 0 and len(all_predictions) >= max_val_images:
+            break
+
     if coco_evaluator is not None and all_predictions:
+        # Restrict COCO evaluation to just the image IDs we ran predictions on. Without this,
+        # the evaluator iterates every GT image ID (params.imgIds defaults to the full val
+        # set) and counts unpredicted images as all-false-negatives, pulling mAP artificially
+        # low and making epoch-to-epoch deltas noisy when each epoch samples a different
+        # subset via shuffle=True + max_val_images
+        predicted_ids = list(all_predictions.keys())
+        for ce in coco_evaluator.coco_eval.values():
+            ce.params.imgIds = predicted_ids
+
         coco_evaluator.update(all_predictions)
         coco_evaluator.synchronize_between_processes()
         coco_evaluator.accumulate()
