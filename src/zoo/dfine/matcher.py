@@ -135,6 +135,18 @@ def _gpu_auction_lap(
     return obj_of_person, converged
 
 
+def _gpu_auction_is_viable(device: torch.device) -> bool:
+    """The auction loop does ~128*Tmax kernel launches per batch with scatter_reduce + topk
+    + a per-iter `.any()` sync. This amortizes well on Ampere+ (plenty of SMs, high kernel
+    dispatch throughput) but is catastrophic on Turing (T4, sm_75) — it measured ~40× slower
+    than the batched CPU/scipy path on real training workloads. Gate strictly on sm_80+.
+    """
+    if not (device.type == "cuda" and torch.cuda.is_available()):
+        return False
+    major, _ = torch.cuda.get_device_capability(device)
+    return major >= 8
+
+
 @torch.no_grad()
 def _auction_match_from_flat_cost(
     C_flat: torch.Tensor, num_queries: int, sizes: List[int]
@@ -271,8 +283,10 @@ class HungarianMatcher(nn.Module):
             C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
             cost_stack.append(C.view(bs, num_queries, -1))
 
-        # GPU path: pool all (num_heads * bs) problems into one auction call
-        if cost_stack[0].is_cuda and total_T > 0:
+        # GPU path: pool all (num_heads * bs) problems into one auction call — only on
+        # Ampere+ where the auction amortizes; falls through to the batched CPU path below
+        # on Turing (T4) and earlier
+        if _gpu_auction_is_viable(cost_stack[0].device) and total_T > 0:
             Tmax = max(sizes)
             NH_bs = num_heads * bs
             device = cost_stack[0].device
@@ -396,9 +410,10 @@ class HungarianMatcher(nn.Module):
         C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
         sizes = [len(v["boxes"]) for v in targets]
 
-        # GPU auction path — eliminates the C.cpu() sync and the scipy LAP. get_top_k_matches
-        # still needs the CPU path (return_topk=True), so we only route non-topk calls here
-        if not return_topk and C.is_cuda:
+        # GPU auction path — eliminates the C.cpu() sync and the scipy LAP, but only viable
+        # on Ampere+ (see _gpu_auction_is_viable). get_top_k_matches still needs the CPU
+        # path (return_topk=True), so we only route non-topk calls here
+        if not return_topk and _gpu_auction_is_viable(C.device):
             return {"indices": _auction_match_from_flat_cost(C, num_queries, sizes)}
 
         C = C.view(bs, num_queries, -1).cpu()
