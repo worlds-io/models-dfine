@@ -5,6 +5,8 @@ Modules to compute the matching cost and solve the corresponding LSAP.
 Copyright (c) 2024 The D-FINE Authors All Rights Reserved.
 """
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -17,185 +19,20 @@ from ...core import register
 from .box_ops import box_cxcywh_to_xyxy, generalized_box_iou
 
 
-@torch.no_grad()
-def _gpu_auction_lap(
-    cost: torch.Tensor,
-    active: torch.Tensor,
-    max_iters_factor: int = 128,
-    sync_check_every: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Solve a batch of bipartite LAP instances on the GPU via parallel (Jacobi-style)
-    forward auction.
-
-    Persons = targets, objects = predictions (queries). Partial-assignment auction — each
-    active person eventually gets a distinct object, requires num_objects >= num_active
-    (satisfied by DETR's num_queries >= num_targets).
-
-    Uses a single tight epsilon = tol/(Tmax+1) so the produced assignment's total cost is
-    within `tol` of scipy's. Fully vectorized updates — no ``torch.nonzero`` per-iter — but
-    the early-exit probe does call ``.any()`` on the GPU each iteration, which syncs.
-    ``sync_check_every`` defaults to 1 because bakeoffs showed the per-iter sync cost to be
-    negligible vs. the cost of running a few extra rounds past convergence; raise it if you
-    need to amortize further.
-
-    Args:
-        cost: [B, Q, Tmax] float32 cost tensor.
-        active: [B, Tmax] bool — True for real targets, False for padded slots.
-        max_iters_factor: safety budget multiplier on iterations.
-        sync_check_every: run the `all-assigned?` early-exit probe every N iterations.
-            Higher values reduce syncs at the cost of running extra rounds past convergence.
-
-    Returns:
-        obj_of_person: [B, Tmax] long. For active persons, the assigned object (query) index.
-                       For inactive slots, -1.
-        converged: [B] bool. False if the auction exhausted its iteration budget without
-                   fully assigning all active persons for that problem.
-    """
-    B, Q, Tmax = cost.shape
-    device = cost.device
-    dtype = cost.dtype
-
-    v = (-cost).transpose(1, 2).contiguous()  # [B, Tmax, Q], benefit-major
-    v = torch.where(active[:, :, None], v, v.new_full((1,), -1e30))
-
-    # Single tight eps — Bertsekas bound: total-cost error <= Tmax * eps. Epsilon scaling
-    # was attempted but destabilizes partial-assignment auction (num_queries > num_targets)
-    # where an overshot coarse price on the true optimum has no competing bidders to recover
-    # it at finer scales. The win we capture instead is fully vectorized (no torch.nonzero)
-    # updates and an amortized early-exit probe — this pushes 10× speedup over the naive
-    # version for the same final accuracy
-    tol_total = 1e-3
-    eps = max(tol_total / max(Tmax, 1), 1e-8)
-
-    price = torch.zeros(B, Q, device=device, dtype=dtype)
-    obj_of_person = torch.full((B, Tmax), -1, dtype=torch.long, device=device)
-
-    max_iters = min(max_iters_factor * max(Tmax, 1) + 64, 50000)
-
-    person_arange = torch.arange(Tmax, device=device).expand(B, Tmax)
-    NEG_INF = float("-inf")
-    UNASSIGNED = -1
-
-    it = 0
-    while it < max_iters:
-        bidders = active & (obj_of_person == UNASSIGNED)
-
-        adj = v - price[:, None, :]
-        adj = torch.where(bidders[:, :, None], adj, adj.new_full((1,), NEG_INF))
-        top2 = torch.topk(adj, k=min(2, Q), dim=-1)
-        best_obj = top2.indices[..., 0]
-        best_val = top2.values[..., 0]
-        second_val = top2.values[..., 1] if top2.values.shape[-1] > 1 else best_val - 1.0
-        bid = best_val - second_val + eps
-        bid = torch.where(bidders, bid, bid.new_full((1,), NEG_INF))
-
-        bid_buf = torch.full((B, Q), NEG_INF, device=device, dtype=dtype)
-        bid_buf.scatter_reduce_(1, best_obj, bid, reduce="amax", include_self=True)
-
-        LARGE = Tmax + 1
-        bidder_has_winning_bid = (
-            bidders
-            & torch.isfinite(bid)
-            & (bid_buf.gather(1, best_obj) == bid)
-        )
-        cand_person = torch.where(
-            bidder_has_winning_bid, person_arange, person_arange.new_full((1,), LARGE)
-        )
-        winner_per_obj = torch.full((B, Q), LARGE, dtype=torch.long, device=device)
-        winner_per_obj.scatter_reduce_(1, best_obj, cand_person, reduce="amin", include_self=True)
-        has_winner = winner_per_obj < LARGE
-
-        actual_winner_for_my_target = winner_per_obj.gather(1, best_obj)
-        is_winner = bidder_has_winning_bid & (actual_winner_for_my_target == person_arange)
-
-        safe_prev_obj = obj_of_person.clamp(min=0)
-        prev_obj_has_winner = has_winner.gather(1, safe_prev_obj)
-        prev_obj_new_owner = winner_per_obj.gather(1, safe_prev_obj)
-        was_displaced = (
-            (obj_of_person >= 0)
-            & prev_obj_has_winner
-            & (prev_obj_new_owner != person_arange)
-        )
-
-        obj_of_person = torch.where(
-            is_winner,
-            best_obj,
-            torch.where(was_displaced, obj_of_person.new_full((1,), UNASSIGNED), obj_of_person),
-        )
-
-        bid_add = torch.where(has_winner, bid_buf, bid_buf.new_zeros(()))
-        price = price + bid_add
-
-        it += 1
-        if it % sync_check_every == 0:
-            if not (active & (obj_of_person == UNASSIGNED)).any():
-                break
-
-    converged = ~(active & (obj_of_person == UNASSIGNED)).any(dim=1)
-    return obj_of_person, converged
+# Persistent thread pool for parallel scipy.linear_sum_assignment calls.
+# scipy's LAP is implemented in C and releases the GIL, so threads deliver real concurrency.
+# Sized to fill the CPU without over-subscribing threads that compete with the dataloader
+# workers for CPU time.
+_LAP_POOL_WORKERS = max(1, min((os.cpu_count() or 4) - 2, 8))
+_LAP_POOL = ThreadPoolExecutor(max_workers=_LAP_POOL_WORKERS, thread_name_prefix="lap")
 
 
-def _gpu_auction_is_viable(device: torch.device) -> bool:
-    """The auction loop does ~128*Tmax kernel launches per batch with scatter_reduce + topk
-    + a per-iter `.any()` sync. This amortizes well on Ampere+ (plenty of SMs, high kernel
-    dispatch throughput) but is catastrophic on Turing (T4, sm_75) — it measured ~40× slower
-    than the batched CPU/scipy path on real training workloads. Gate strictly on sm_80+.
-    """
-    if not (device.type == "cuda" and torch.cuda.is_available()):
-        return False
-    major, _ = torch.cuda.get_device_capability(device)
-    return major >= 8
-
-
-@torch.no_grad()
-def _auction_match_from_flat_cost(
-    C_flat: torch.Tensor, num_queries: int, sizes: List[int]
-) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    """Pad the flat [bs*Q, total_T] cost into a batched [bs, Q, Tmax] tensor, run the GPU
-    auction, and unpack per-image (query_idx, target_idx) tuples matching scipy's output
-    convention. Any image whose auction fails to converge falls back to scipy on CPU for
-    just that image.
-    """
-    bs = len(sizes)
-    Tmax = max(sizes) if sizes else 0
-    if Tmax == 0:
-        empty = torch.empty(0, dtype=torch.long)
-        return [(empty.clone(), empty.clone()) for _ in sizes]
-
-    device = C_flat.device
-    C_view = C_flat.view(bs, num_queries, -1)  # [bs, Q, total_T]
-    C_padded = C_flat.new_zeros((bs, num_queries, Tmax))
-    active = torch.zeros(bs, Tmax, dtype=torch.bool, device=device)
-    offset = 0
-    for i, t in enumerate(sizes):
-        if t > 0:
-            C_padded[i, :, :t] = C_view[i, :, offset : offset + t]
-            active[i, :t] = True
-        offset += t
-
-    C_padded = torch.nan_to_num(C_padded, nan=1.0)
-    obj_of_person, converged = _gpu_auction_lap(C_padded, active)
-
-    converged_cpu = converged.cpu().tolist()
-    obj_cpu = obj_of_person.cpu()
-    indices: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    for i, t in enumerate(sizes):
-        if t == 0:
-            empty = torch.empty(0, dtype=torch.long)
-            indices.append((empty.clone(), empty.clone()))
-            continue
-        if converged_cpu[i]:
-            rows = obj_cpu[i, :t].to(dtype=torch.long)
-            cols = torch.arange(t, dtype=torch.long)
-            indices.append((rows, cols))
-        else:
-            # Rare fallback: CPU scipy for just this problem
-            C_i = C_padded[i, :, :t].detach().cpu().numpy()
-            row_ind, col_ind = linear_sum_assignment(C_i)
-            indices.append(
-                (torch.as_tensor(row_ind, dtype=torch.long), torch.as_tensor(col_ind, dtype=torch.long))
-            )
-    return indices
+def _lap_one(args: Tuple[int, np.ndarray]) -> Tuple[int, np.ndarray, np.ndarray]:
+    """Solve a single LAP instance. Returns (task_id, row_ind, col_ind) so the caller can
+    reassemble results in order without relying on submission order."""
+    task_id, C = args
+    row_ind, col_ind = linear_sum_assignment(C)
+    return task_id, row_ind, col_ind
 
 
 @register()
@@ -283,69 +120,49 @@ class HungarianMatcher(nn.Module):
             C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
             cost_stack.append(C.view(bs, num_queries, -1))
 
-        # GPU path: pool all (num_heads * bs) problems into one auction call — only on
-        # Ampere+ where the auction amortizes; falls through to the batched CPU path below
-        # on Turing (T4) and earlier
-        if _gpu_auction_is_viable(cost_stack[0].device) and total_T > 0:
-            Tmax = max(sizes)
-            NH_bs = num_heads * bs
-            device = cost_stack[0].device
-            # Build padded per-problem cost tensor [NH_bs, Q, Tmax] — each head has its own
-            # per-image target slice at positions [offset, offset+t). Pad unused slots with
-            # zero; the `active` mask masks them out in the auction kernel anyway
-            C_padded = cost_stack[0].new_zeros((NH_bs, num_queries, Tmax))
-            active = torch.zeros(NH_bs, Tmax, dtype=torch.bool, device=device)
-            for h, C_h in enumerate(cost_stack):
-                offset = 0
-                for i, t in enumerate(sizes):
-                    row = h * bs + i
-                    if t > 0:
-                        C_padded[row, :, :t] = C_h[i, :, offset : offset + t]
-                        active[row, :t] = True
-                    offset += t
-
-            C_padded = torch.nan_to_num(C_padded, nan=1.0)
-            obj_of_person, converged = _gpu_auction_lap(C_padded, active)
-            converged_cpu = converged.cpu().tolist()
-            obj_cpu = obj_of_person.cpu()
-
-            out: List[List[Tuple[torch.Tensor, torch.Tensor]]] = []
-            for h in range(num_heads):
-                head_indices: List[Tuple[torch.Tensor, torch.Tensor]] = []
-                for i, t in enumerate(sizes):
-                    row = h * bs + i
-                    if t == 0:
-                        empty = torch.empty(0, dtype=torch.long)
-                        head_indices.append((empty.clone(), empty.clone()))
-                    elif converged_cpu[row]:
-                        rows = obj_cpu[row, :t].to(dtype=torch.long)
-                        cols = torch.arange(t, dtype=torch.long)
-                        head_indices.append((rows, cols))
-                    else:
-                        # Rare fallback: CPU scipy for the single image
-                        C_i = C_padded[row, :, :t].detach().cpu().numpy()
-                        row_ind, col_ind = linear_sum_assignment(C_i)
-                        head_indices.append(
-                            (torch.as_tensor(row_ind, dtype=torch.long), torch.as_tensor(col_ind, dtype=torch.long))
-                        )
-                out.append(head_indices)
-            return out
-
-        # CPU fallback: single .cpu() transfer for the whole stack, then per-head scipy
+        # Single .cpu() transfer for the whole stack, then run each per-(head, image) LAP
+        # concurrently through a thread pool. scipy.linear_sum_assignment releases the GIL,
+        # so the threads deliver real parallelism (not pseudo-parallelism gated by the GIL).
+        # The .cpu() is a blocking transfer — the main thread can't start the first LAP
+        # until the GPU forward pass has produced the cost matrices — but from that point
+        # on, running num_heads × bs problems in parallel instead of sequentially is a
+        # direct wall-clock win proportional to min(num_heads × bs, pool_size).
         cost_all_cpu = torch.stack(cost_stack, dim=0).cpu()
-        cost_all_cpu = torch.nan_to_num(cost_all_cpu, nan=1.0)
-        out = []
+        cost_all_cpu = torch.nan_to_num(cost_all_cpu, nan=1.0).numpy()
+
+        # Build a flat task list with deterministic task_ids so we can reassemble
+        # results in order regardless of completion order. Each split chunk has shape
+        # [bs, Q, sizes[i]]; we select row `i` to get image `i`'s own cost matrix.
+        tasks: List[Tuple[int, np.ndarray]] = []
         for h in range(num_heads):
-            indices_pre = [
-                linear_sum_assignment(c[i])
-                for i, c in enumerate(cost_all_cpu[h].split(sizes, -1))
-            ]
-            out.append(
-                [
-                    (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
-                    for i, j in indices_pre
-                ]
-            )
+            per_head_chunks = np.split(cost_all_cpu[h], np.cumsum(sizes)[:-1], axis=-1)
+            for i, chunk in enumerate(per_head_chunks):
+                if sizes[i] > 0:
+                    task_id = h * bs + i
+                    tasks.append((task_id, chunk[i]))
+
+        # Submit all LAP problems to the shared thread pool. executor.map preserves the
+        # iteration order of results, so we can zip them back with the (h, i) pairs
+        results: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+        for task_id, row_ind, col_ind in _LAP_POOL.map(_lap_one, tasks):
+            results[task_id] = (row_ind, col_ind)
+
+        # Reassemble per-head per-image index pairs, filling in empties for zero-target imgs
+        out: List[List[Tuple[torch.Tensor, torch.Tensor]]] = []
+        empty = torch.empty(0, dtype=torch.int64)
+        for h in range(num_heads):
+            head_indices: List[Tuple[torch.Tensor, torch.Tensor]] = []
+            for i in range(bs):
+                task_id = h * bs + i
+                if task_id not in results:
+                    head_indices.append((empty.clone(), empty.clone()))
+                else:
+                    row_ind, col_ind = results[task_id]
+                    head_indices.append((
+                        torch.as_tensor(row_ind, dtype=torch.int64),
+                        torch.as_tensor(col_ind, dtype=torch.int64),
+                    ))
+            out.append(head_indices)
         return out
 
     @torch.no_grad()
@@ -410,20 +227,33 @@ class HungarianMatcher(nn.Module):
         C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
         sizes = [len(v["boxes"]) for v in targets]
 
-        # GPU auction path — eliminates the C.cpu() sync and the scipy LAP, but only viable
-        # on Ampere+ (see _gpu_auction_is_viable). get_top_k_matches still needs the CPU
-        # path (return_topk=True), so we only route non-topk calls here
-        if not return_topk and _gpu_auction_is_viable(C.device):
-            return {"indices": _auction_match_from_flat_cost(C, num_queries, sizes)}
-
         C = C.view(bs, num_queries, -1).cpu()
-
         C = torch.nan_to_num(C, nan=1.0)
-        indices_pre = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
-        indices = [
-            (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
-            for i, j in indices_pre
-        ]
+
+        if return_topk:
+            # get_top_k_matches does multiple rounds of scipy on the same cost matrices and
+            # needs the full C tensor for in-place masking between rounds, so keep this
+            # single-threaded.
+            indices_pre = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
+            indices = [
+                (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
+                for i, j in indices_pre
+            ]
+        else:
+            # Parallel scipy via the shared thread pool — same GIL-release trick as
+            # batch_forward. Single-head has only bs problems (vs num_heads × bs in
+            # batch_forward), so the win here is smaller but still real.
+            chunks = list(C.split(sizes, -1))
+            tasks = [(i, chunks[i][i].numpy()) for i in range(bs) if sizes[i] > 0]
+            results: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+            for task_id, row_ind, col_ind in _LAP_POOL.map(_lap_one, tasks):
+                results[task_id] = (row_ind, col_ind)
+            empty_np = np.empty(0, dtype=np.int64)
+            indices_pre = [results.get(i, (empty_np, empty_np)) for i in range(bs)]
+            indices = [
+                (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
+                for i, j in indices_pre
+            ]
 
         # Compute topk indices
         if return_topk:
