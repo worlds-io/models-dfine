@@ -125,8 +125,14 @@ class DetSolver(BaseSolver):
                 if k in best_stat:
                     prev_best = best_stat[k]
                     if current_map > prev_best + early_stopping_min_delta:
+                        # Only ratchet the "improvement target" when the gain clears
+                        # min_delta. Previously this was a two-tier check (inner `if
+                        # current_map > prev_best` updated best_stat on any rise), which
+                        # silently moved the bar each epoch — a run of 0.001-sized
+                        # improvements would end up failing patience even though mAP kept
+                        # climbing. Checkpoint save below uses top1, not best_stat, so
+                        # sub-delta bumps still get persisted if they're absolute maxes
                         improved = True
-                    if current_map > prev_best:
                         best_stat["epoch"] = epoch
                         best_stat[k] = current_map
                 else:
