@@ -82,6 +82,17 @@ class BaseConfig(object):
         self.early_stopping_min_delta: float = 0
         self.gradient_accumulation_steps: int = 1
 
+        # Cap on val-set size per eval. Full val loops accumulate predictions for every
+        # image into one dict before CocoEvaluator.update() runs; with shuffle=True on
+        # the val loader, a cap makes each epoch's eval a different random subset and
+        # keeps the end-of-epoch memory spike bounded. 0 = no cap (full val).
+        #
+        # NOTE: applied per-rank. Under DDP the total images evaluated per epoch is
+        # world_size * max_val_images, since each rank independently breaks when its own
+        # local prediction dict hits the cap. Size this value relative to per-rank memory,
+        # not the global val budget
+        self.max_val_images: int = 0
+
     @property
     def model(self) -> nn.Module:
         return self._model
@@ -148,6 +159,7 @@ class BaseConfig(object):
                 num_workers=self.num_workers,
                 collate_fn=self.collate_fn,
                 shuffle=self.train_shuffle,
+                persistent_workers=self.num_workers > 0,
                 # Pin host memory so batch tensors can be uploaded to the GPU via DMA without
                 # a pageable->pinned->GPU copy. Profiling showed ~5-7 ms per iter stuck in the
                 # H2D image upload path; pinning lets that overlap with the previous iter's
@@ -166,6 +178,12 @@ class BaseConfig(object):
     @property
     def val_dataloader(self) -> DataLoader:
         if self._val_dataloader is None and self.val_dataset is not None:
+            # Non-persistent val workers. Val runs once per epoch — when workers persist,
+            # each one holds several GiB of private (COW-broken) pages after its first run
+            # (pycocotools indices, Python heap pages touched during iteration). With 4
+            # workers that's ~8 GiB of RSS that sticks around between epochs, triggering
+            # K8s eviction on constrained pods. Re-forking at each val costs ~10-20s of
+            # startup but releases that memory cleanly when val ends
             loader = DataLoader(
                 self.val_dataset,
                 batch_size=self.val_batch_size,
@@ -173,7 +191,7 @@ class BaseConfig(object):
                 drop_last=False,
                 collate_fn=self.collate_fn,
                 shuffle=self.val_shuffle,
-                persistent_workers=True,
+                persistent_workers=False,
             )
             loader.shuffle = self.val_shuffle
             self._val_dataloader = loader

@@ -6,6 +6,7 @@ Modified from DETR (https://github.com/facebookresearch/detr/blob/main/engine.py
 Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 """
 
+import gc
 import math
 import sys
 from typing import Dict, Iterable, List
@@ -23,6 +24,20 @@ from ..data.dataset import mscoco_category2label
 from ..misc import MetricLogger, SmoothedValue, dist_utils, save_samples
 from ..optim import ModelEMA, Warmup
 from .validator import Validator, scale_boxes
+
+
+def _release_allocator_arenas() -> None:
+    """Tell glibc to return empty arenas to the OS. CPython + glibc keep freed memory in
+    per-thread arenas indefinitely unless explicitly told to trim; without this call, each
+    val run leaves multi-GB of "free but not returned" memory in the process, which
+    eventually trips k8s eviction. Requires PYTHONMALLOC=malloc in the pod env for Python's
+    small-object allocations to go through glibc (otherwise they stay in obmalloc pools
+    which are not trimmable)."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def train_one_epoch(
@@ -188,22 +203,43 @@ def evaluate(
     # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
 
     output_dir = kwargs.get("output_dir", None)
+    max_val_images = kwargs.get("max_val_images", 0) or 0
 
+    # Accumulate raw predictions, then run a single coco_evaluator.update() at the end.
+    # The library's per-batch update() pattern runs coco_eval.evaluate() inside every call
+    # and appends a per-(cat × area × batch_size) numpy array of C++ eval wrappers to
+    # eval_imgs[iou] — at production scale (27k val images, 80 cats, 4 areas, bs 16) that
+    # accumulates >8M wrappers over the val loop, allocated into the process heap and never
+    # returned until the val ends. A single end-of-loop update() converts per-batch growth
+    # into one end-of-val peak with the same total wrappers but a much shorter residency
+    all_predictions: Dict = {}
     for samples, targets in data_loader:
         samples = samples.to(device, non_blocking=True)
         targets = [{k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
 
         outputs = model(samples)
-
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
-
         results = postprocessor(outputs, orig_target_sizes)
 
-        res = {target["image_id"].item(): output for target, output in zip(targets, results)}
-        if coco_evaluator is not None:
-            coco_evaluator.update(res)
+        for target, output in zip(targets, results):
+            img_id = target["image_id"].item()
+            all_predictions[img_id] = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                                        for k, v in output.items()}
 
-    if coco_evaluator is not None:
+        if max_val_images > 0 and len(all_predictions) >= max_val_images:
+            break
+
+    if coco_evaluator is not None and all_predictions:
+        # Restrict COCO evaluation to just the image IDs we ran predictions on. Without this,
+        # the evaluator iterates every GT image ID (params.imgIds defaults to the full val
+        # set) and counts unpredicted images as all-false-negatives, pulling mAP artificially
+        # low and making epoch-to-epoch deltas noisy when each epoch samples a different
+        # subset via shuffle=True + max_val_images
+        predicted_ids = list(all_predictions.keys())
+        for ce in coco_evaluator.coco_eval.values():
+            ce.params.imgIds = predicted_ids
+
+        coco_evaluator.update(all_predictions)
         coco_evaluator.synchronize_between_processes()
         coco_evaluator.accumulate()
         # summarize() populates .stats — suppress its verbose table
@@ -234,5 +270,42 @@ def evaluate(
                 stats["coco_eval_bbox"] = s
         if "segm" in iou_types:
             stats["coco_eval_masks"] = coco_evaluator.coco_eval["segm"].stats.tolist()
+
+        # Aggressively release per-val state. The critical retained buffers:
+        #   - eval_imgs[iou]: list of per-batch np.array(_evalImgs_cpp) arrays, one per
+        #     update() call — O(N_batches × cats × areas × bs) wrappers
+        #   - coco_eval[iou]._evalImgs_cpp: merged eval buffer after synchronize
+        #   - coco_eval[iou].gt_dataset / .dt_dataset: C++ datasets holding per-annotation
+        #     Python-wrapped instances (NOT cleared by library until next _prepare() call)
+        #   - coco_eval[iou].ious: dict of per-(imgId, catId) IoU ndarrays
+        #   - coco_eval[iou].cocoDt: last batch's detection COCO object
+        #   - coco_eval[iou]._paramsEval: deepcopy of params from last update
+        # coco_eval itself is preserved so the solver can read .stats; the structures that
+        # don't contribute to stats are all released here
+        coco_evaluator.img_ids = []
+        coco_evaluator.eval_imgs = {k: [] for k in coco_evaluator.iou_types}
+        for ce in coco_evaluator.coco_eval.values():
+            if hasattr(ce, "_evalImgs_cpp"):
+                ce._evalImgs_cpp = None
+            if hasattr(ce, "evalImgs"):
+                ce.evalImgs = None
+            if hasattr(ce, "gt_dataset") and hasattr(ce.gt_dataset, "clean"):
+                ce.gt_dataset.clean()
+            if hasattr(ce, "dt_dataset") and hasattr(ce.dt_dataset, "clean"):
+                ce.dt_dataset.clean()
+            ce.ious = {}
+            ce.cocoDt = None
+            ce._paramsEval = None
+
+    # Drop the per-val prediction dict before trimming. Bulk CPU tensor data lives in
+    # torch's caching allocator and isn't affected by malloc_trim, but the dict wrappers
+    # and int image_id keys live on the Python heap (glibc arenas under PYTHONMALLOC=malloc)
+    # and only get returned to the OS if freed before the trim call
+    all_predictions = None
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    _release_allocator_arenas()
 
     return stats, coco_evaluator

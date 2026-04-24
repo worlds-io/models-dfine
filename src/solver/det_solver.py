@@ -7,6 +7,7 @@ Copyright (c) 2023 lyuwenyu. All Rights Reserved.
 """
 
 import datetime
+import gc
 import json
 import time
 
@@ -46,6 +47,7 @@ class DetSolver(BaseSolver):
                 self.device,
                 self.last_epoch,
                 False,
+                max_val_images=args.max_val_images,
             )
             for k in test_stats:
                 best_stat["epoch"] = self.last_epoch
@@ -107,6 +109,7 @@ class DetSolver(BaseSolver):
                 epoch,
                 False,
                 output_dir=self.output_dir,
+                max_val_images=args.max_val_images,
             )
 
             # Track improvement for early stopping.
@@ -122,8 +125,14 @@ class DetSolver(BaseSolver):
                 if k in best_stat:
                     prev_best = best_stat[k]
                     if current_map > prev_best + early_stopping_min_delta:
+                        # Only ratchet the "improvement target" when the gain clears
+                        # min_delta. Previously this was a two-tier check (inner `if
+                        # current_map > prev_best` updated best_stat on any rise), which
+                        # silently moved the bar each epoch — a run of 0.001-sized
+                        # improvements would end up failing patience even though mAP kept
+                        # climbing. Checkpoint save below uses top1, not best_stat, so
+                        # sub-delta bumps still get persisted if they're absolute maxes
                         improved = True
-                    if current_map > prev_best:
                         best_stat["epoch"] = epoch
                         best_stat[k] = current_map
                 else:
@@ -183,6 +192,15 @@ class DetSolver(BaseSolver):
                                 coco_evaluator.coco_eval["bbox"].eval,
                                 self.output_dir / "eval" / name,
                             )
+
+            # Explicit gc.collect() at the end of each epoch — cyclic garbage from autograd
+            # wrappers, etc. The end-of-evaluate() malloc_trim in det_engine.py returns
+            # freed glibc arenas to the OS; without it the ~6 GB of eval-phase transient
+            # allocations sit in the process heap until the next val rewrites them and
+            # trigger k8s eviction long before the actual limit
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -248,6 +266,7 @@ class DetSolver(BaseSolver):
             self.device,
             epoch=-1,
             use_wandb=False,
+            max_val_images=self.cfg.max_val_images,
         )
 
         if self.output_dir:
