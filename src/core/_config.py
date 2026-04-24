@@ -86,6 +86,11 @@ class BaseConfig(object):
         # image into one dict before CocoEvaluator.update() runs; with shuffle=True on
         # the val loader, a cap makes each epoch's eval a different random subset and
         # keeps the end-of-epoch memory spike bounded. 0 = no cap (full val).
+        #
+        # NOTE: applied per-rank. Under DDP the total images evaluated per epoch is
+        # world_size * max_val_images, since each rank independently breaks when its own
+        # local prediction dict hits the cap. Size this value relative to per-rank memory,
+        # not the global val budget
         self.max_val_images: int = 0
 
     @property

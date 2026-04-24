@@ -6,6 +6,7 @@ Modified from DETR (https://github.com/facebookresearch/detr/blob/main/engine.py
 Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 """
 
+import gc
 import math
 import sys
 from typing import Dict, Iterable, List
@@ -295,6 +296,13 @@ def evaluate(
             ce.ious = {}
             ce.cocoDt = None
             ce._paramsEval = None
+
+    # Drop the per-val prediction dict before trimming. Bulk CPU tensor data lives in
+    # torch's caching allocator and isn't affected by malloc_trim, but the dict wrappers
+    # and int image_id keys live on the Python heap (glibc arenas under PYTHONMALLOC=malloc)
+    # and only get returned to the OS if freed before the trim call
+    all_predictions = None
+    gc.collect()
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
