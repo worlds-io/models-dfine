@@ -36,6 +36,10 @@ class DetSolver(BaseSolver):
         top1 = 0
         best_stat = {"epoch": -1}
 
+        # Per-stage best mAP, persisted to stage_metrics.json
+        best_stg1_map = 0.0
+        best_stg2_map = 0.0
+
         if self.last_epoch > 0:
             module = self.ema.module if self.ema else self.model
             test_stats, coco_evaluator = evaluate(
@@ -145,9 +149,14 @@ class DetSolver(BaseSolver):
                     top1 = current_map
                     if self.output_dir:
                         if stage == 2:
+                            best_stg2_map = current_map
                             dist_utils.save_on_master(self.state_dict(), self.output_dir / "best_stg2.pth")
                         else:
+                            best_stg1_map = current_map
                             dist_utils.save_on_master(self.state_dict(), self.output_dir / "best_stg1.pth")
+                        if dist_utils.is_main_process():
+                            with (self.output_dir / "stage_metrics.json").open("w") as f:
+                                json.dump({"stg1_map": best_stg1_map, "stg2_map": best_stg2_map}, f)
 
             epoch_time = int(time.time() - epoch_start_time)
             if improved:
