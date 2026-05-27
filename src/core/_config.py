@@ -82,6 +82,20 @@ class BaseConfig(object):
         self.early_stopping_min_delta: float = 0
         self.gradient_accumulation_steps: int = 1
 
+        # Anti-Forgetting Sampling Strategy (see src/data/afss.py). Disabled by default;
+        # set via --update from the Go orchestrator. Single-GPU only.
+        self.afss_enabled: bool = False
+        self.afss_score_only: bool = False
+        self.afss_easy_thresh: float = 0.9
+        self.afss_medium_thresh: float = 0.5
+        self.afss_easy_keep_frac: float = 0.15
+        self.afss_medium_keep_frac: float = 0.5
+        self.afss_hard_repeat: int = 1
+        self.afss_refresh_period: int = 5
+        self.afss_iou_thresh: float = 0.5
+        self.afss_conf_thresh: float = 0.5
+        self.afss_max_score_images: int = 5000
+
         # Cap on val-set size per eval. Full val loops accumulate predictions for every
         # image into one dict before CocoEvaluator.update() runs; with shuffle=True on
         # the val loader, a cap makes each epoch's eval a different random subset and

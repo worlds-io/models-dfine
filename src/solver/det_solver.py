@@ -33,6 +33,17 @@ class DetSolver(BaseSolver):
         early_stopping_patience = getattr(args, 'early_stopping_patience', 0)
         early_stopping_min_delta = getattr(args, 'early_stopping_min_delta', 0)
 
+        # AFSS: skip already-learned images each epoch and focus on the hard ones.
+        # Single-GPU only — under DDP warp_loader swaps in a DistributedSampler.
+        self.afss_sampler = None
+        self._afss_force_refresh = False
+        self._afss_scoring_loader = None
+        if getattr(args, 'afss_enabled', False):
+            if dist_utils.is_dist_available_and_initialized():
+                print("[AFSS] disabled: not supported under distributed training")
+            else:
+                self._setup_afss(args)
+
         top1 = 0
         best_stat = {"epoch": -1}
 
@@ -62,6 +73,15 @@ class DetSolver(BaseSolver):
 
         for epoch in range(start_epoch, args.epochs):
             epoch_start_time = time.time()
+
+            # AFSS: re-score sufficiency every refresh_period epochs (and right after a
+            # stage transition, since the model/EMA was just reloaded), then set_epoch
+            # below recomputes the subset for this epoch via the sampler fan-out.
+            if self.afss_sampler is not None and (
+                self.afss_sampler.needs_refresh(epoch) or self._afss_force_refresh
+            ):
+                self._afss_refresh(epoch)
+                self._afss_force_refresh = False
 
             self.train_dataloader.set_epoch(epoch)
             if dist_utils.is_dist_available_and_initialized():
@@ -206,10 +226,81 @@ class DetSolver(BaseSolver):
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print("Training time {}".format(total_time_str))
 
+    def _setup_afss(self, args):
+        """Rebuild the train loader to draw indices from an AFSSSampler.
+
+        torch's DataLoader forbids reassigning sampler/batch_sampler after init, so we
+        reconstruct an equivalent loader (same class, dataset, collate_fn, workers) with
+        sampler= instead of shuffle=True. The AFSSState is hung on the solver so it's
+        captured by BaseSolver.state_dict() for resume.
+        """
+        from ..data.afss import AFSSSampler
+
+        loader = self.train_dataloader
+        sampler = AFSSSampler(
+            num_images=len(loader.dataset),
+            easy_thresh=args.afss_easy_thresh,
+            medium_thresh=args.afss_medium_thresh,
+            easy_keep_frac=args.afss_easy_keep_frac,
+            medium_keep_frac=args.afss_medium_keep_frac,
+            hard_repeat=args.afss_hard_repeat,
+            refresh_period=args.afss_refresh_period,
+            score_only=args.afss_score_only,
+        )
+        kwargs = dict(
+            batch_size=loader.batch_size,
+            sampler=sampler,
+            drop_last=loader.drop_last,
+            collate_fn=loader.collate_fn,
+            num_workers=loader.num_workers,
+            pin_memory=loader.pin_memory,
+            persistent_workers=loader.persistent_workers,
+        )
+        if loader.num_workers > 0:
+            kwargs["prefetch_factor"] = loader.prefetch_factor
+        new_loader = type(loader)(loader.dataset, **kwargs)
+        new_loader.shuffle = False
+        new_loader.afss_sampler = sampler
+
+        self.train_dataloader = new_loader
+        self.afss_sampler = sampler
+        self.afss_state = sampler.state
+        print(
+            f"[AFSS] enabled: {len(loader.dataset)} train images, refresh every "
+            f"{sampler.refresh_period} epochs, score_only={sampler.score_only}"
+        )
+
+    def _afss_refresh(self, epoch):
+        """Score the training set (on the EMA model) and update the sampler's tiers."""
+        from ..data.afss import build_scoring_loader, score_train_set
+
+        args = self.cfg
+        if self._afss_scoring_loader is None:
+            self._afss_scoring_loader = build_scoring_loader(
+                self.train_dataloader.dataset,
+                batch_size=self.train_dataloader.batch_size,
+                num_workers=self.train_dataloader.num_workers,
+                collate_fn=self.train_dataloader.collate_fn,
+                max_images=args.afss_max_score_images,
+            )
+        module = self.ema.module if self.ema else self.model
+        scores = score_train_set(
+            module,
+            self.postprocessor,
+            self._afss_scoring_loader,
+            self.device,
+            conf_thresh=args.afss_conf_thresh,
+            iou_thresh=args.afss_iou_thresh,
+        )
+        self.afss_sampler.update_sufficiency(scores, epoch)
+
     def _enter_stage2(self, epoch):
         """Transition from stage 1 to stage 2: reload best checkpoint, disable augmentation,
         unfreeze late backbone, drop LR, refresh EMA."""
         print(f"Entering stage 2 at epoch {epoch + 1}")
+        # Sufficiency computed before this reload is stale (model/EMA just changed);
+        # force an AFSS re-score on the next epoch.
+        self._afss_force_refresh = True
         best_stg1_path = str(self.output_dir / "best_stg1.pth")
         if dist_utils.is_dist_available_and_initialized():
             torch.distributed.barrier()
