@@ -74,6 +74,11 @@ DFINECriterion:
   alpha: 0.75
   gamma: 2.0
   reg_max: 32
+  # Knowledge distillation: when True, scale each matched detection's loss by its
+  # parent-model confidence (COCO annotation "score"). Off by default; the model
+  # trainer flips it on for the distillation/local path. With all-1.0 weights the
+  # loss is identical to the stock loss.
+  use_confidence_weighting: False
 
   matcher:
     type: HungarianMatcher
