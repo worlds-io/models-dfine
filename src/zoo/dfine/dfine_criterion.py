@@ -42,6 +42,7 @@ class DFINECriterion(nn.Module):
         reg_max=32,
         boxes_weight_format=None,
         share_matched_indices=False,
+        use_confidence_weighting=False,
     ):
         """Create the criterion.
         Parameters:
@@ -51,6 +52,9 @@ class DFINECriterion(nn.Module):
             num_classes: number of object categories, omitting the special no-object category.
             reg_max (int): Max number of the discrete bins in D-FINE.
             boxes_weight_format: format for boxes weight (iou, ).
+            use_confidence_weighting: when True, scale each matched detection's loss by
+                its parent-model confidence (target key "weights"), for knowledge
+                distillation. When False (default) the loss is the stock D-FINE loss.
         """
         super().__init__()
         self.num_classes = num_classes
@@ -59,6 +63,7 @@ class DFINECriterion(nn.Module):
         self.losses = losses
         self.boxes_weight_format = boxes_weight_format
         self.share_matched_indices = share_matched_indices
+        self.use_confidence_weighting = use_confidence_weighting
         self.alpha = alpha
         self.gamma = gamma
         self.fgl_targets, self.fgl_targets_dn = None, None
@@ -112,6 +117,14 @@ class DFINECriterion(nn.Module):
         loss = F.binary_cross_entropy_with_logits(
             src_logits, target_score, weight=weight, reduction="none"
         )
+        conf_w = self._matched_confidence_weights(targets, indices)
+        if conf_w is not None:
+            # Scale the classification loss of each matched query by its parent
+            # confidence; unmatched (no-object) queries stay at full weight so the
+            # student still learns where not to fire.
+            vfl_w = torch.ones(src_logits.shape[:2], dtype=loss.dtype, device=loss.device)
+            vfl_w[idx] = conf_w.to(loss.dtype)
+            loss = loss * vfl_w.unsqueeze(-1)
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
         return {"loss_vfl": loss}
 
@@ -125,13 +138,19 @@ class DFINECriterion(nn.Module):
         src_boxes = outputs["pred_boxes"][idx]
         target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
         losses = {}
+        conf_w = self._matched_confidence_weights(targets, indices)
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
+        if conf_w is not None:
+            # Scale each detection's L1 by its parent confidence (broadcast over xywh).
+            loss_bbox = loss_bbox * conf_w.unsqueeze(-1)
         losses["loss_bbox"] = loss_bbox.sum() / num_boxes
 
         loss_giou = 1 - torch.diag(
             generalized_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
         )
         loss_giou = loss_giou if boxes_weight is None else loss_giou * boxes_weight
+        if conf_w is not None:
+            loss_giou = loss_giou * conf_w
         losses["loss_giou"] = loss_giou.sum() / num_boxes
 
         return losses
@@ -144,6 +163,7 @@ class DFINECriterion(nn.Module):
         if "pred_corners" in outputs:
             idx = self._get_src_permutation_idx(indices)
             target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+            conf_w = self._matched_confidence_weights(targets, indices)
 
             pred_corners = outputs["pred_corners"][idx].reshape(-1, (self.reg_max + 1))
             ref_points = outputs["ref_points"][idx].detach()
@@ -175,6 +195,10 @@ class DFINECriterion(nn.Module):
                 )[0]
             )
             weight_targets = ious.unsqueeze(-1).repeat(1, 1, 4).reshape(-1).detach()
+            if conf_w is not None:
+                # Scale the fine-grained localization target weight of each matched
+                # detection (4 corners each) by its parent confidence.
+                weight_targets = weight_targets * conf_w.detach().reshape(-1, 1).repeat(1, 4).reshape(-1)
 
             losses["loss_fgl"] = self.unimodal_distribution_focal_loss(
                 pred_corners,
@@ -200,6 +224,13 @@ class DFINECriterion(nn.Module):
                     weight_targets_local[idx] = ious.reshape_as(weight_targets_local[idx]).to(
                         weight_targets_local.dtype
                     )
+                    if conf_w is not None:
+                        # Scale the matched positions of the decoupled-distillation
+                        # focal weight by parent confidence (unmatched positions keep
+                        # their own teacher-derived weight).
+                        weight_targets_local[idx] = weight_targets_local[idx] * conf_w.to(
+                            weight_targets_local.dtype
+                        )
                     weight_targets_local = (
                         weight_targets_local.unsqueeze(-1).repeat(1, 1, 4).reshape(-1).detach()
                     )
@@ -241,6 +272,22 @@ class DFINECriterion(nn.Module):
         batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
+
+    def _matched_confidence_weights(self, targets, indices):
+        """Per-matched-GT distillation weights, row-aligned with the matched
+        predictions.
+
+        Gathers the per-detection ``weights`` exactly the way matched target boxes
+        are gathered (``cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)])``),
+        so the returned vector lines up 1:1 with ``src_boxes``/``target_boxes``.
+        Returns ``None`` when confidence weighting is disabled or no ``weights`` key
+        is present — callers then leave the loss unscaled (stock D-FINE behaviour).
+        With all-1.0 weights the scaled loss equals the unscaled loss exactly."""
+        if not self.use_confidence_weighting:
+            return None
+        if not targets or "weights" not in targets[0]:
+            return None
+        return torch.cat([t["weights"][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
     def _get_go_indices(self, indices, indices_aux_list):
         """Get a matching union set across all decoder layers."""

@@ -9,6 +9,7 @@ Copyright (c) 2023 lyuwenyu. All Rights Reserved.
 import datetime
 import gc
 import json
+import os
 import time
 
 import torch
@@ -222,7 +223,13 @@ class DetSolver(BaseSolver):
         best_stg1_path = str(self.output_dir / "best_stg1.pth")
         if dist_utils.is_dist_available_and_initialized():
             torch.distributed.barrier()
-        self.load_resume_state(best_stg1_path)
+        # best_stg1.pth only exists once stage 1 improved at least once; if it
+        # never did (tiny/degenerate datasets), continue from current weights
+        # rather than crashing.
+        if os.path.exists(best_stg1_path):
+            self.load_resume_state(best_stg1_path)
+        else:
+            print("No best_stg1.pth (stage 1 never improved) — continuing from current weights")
 
         # Disable augmentation for stage 2 refinement
         self.train_dataloader.collate_fn.stop_epoch = epoch

@@ -18,7 +18,7 @@ from .._misc import (
     BoundingBoxes,
     Image,
     Mask,
-    SanitizeBoundingBoxes,
+    SanitizeBoundingBoxes as _TVSanitizeBoundingBoxes,
     Video,
     _boxes_keys,
     convert_to_tv_tensor,
@@ -34,9 +34,44 @@ Resize = register()(T.Resize)
 # ToImageTensor = register()(T.ToImageTensor)
 # ConvertDtype = register()(T.ConvertDtype)
 # PILToTensor = register()(T.PILToTensor)
-SanitizeBoundingBoxes = register(name="SanitizeBoundingBoxes")(SanitizeBoundingBoxes)
 RandomCrop = register()(T.RandomCrop)
 Normalize = register()(T.Normalize)
+
+
+def _find_distill_target(inputs):
+    """Locate the target dict inside a transform sample (img, target, dataset)."""
+    if isinstance(inputs, dict):
+        return inputs
+    if isinstance(inputs, (tuple, list)):
+        for item in inputs:
+            if isinstance(item, dict) and "labels" in item:
+                return item
+    return None
+
+
+def _labels_and_weights_getter(inputs):
+    """``labels_getter`` for SanitizeBoundingBoxes that also keeps the per-detection
+    confidence ``weights`` tensor row-aligned with boxes/labels when degenerate
+    boxes are dropped. Falls back to labels-only (stock behaviour) when no weights
+    are present. SanitizeBoundingBoxes filters every returned tensor by identity."""
+    target = _find_distill_target(inputs)
+    if target is None:
+        return None
+    if "weights" in target:
+        return (target["labels"], target["weights"])
+    return target["labels"]
+
+
+@register(name="SanitizeBoundingBoxes")
+class SanitizeBoundingBoxes(_TVSanitizeBoundingBoxes):
+    """torchvision ``SanitizeBoundingBoxes`` whose default ``labels_getter`` also
+    filters the distillation ``weights`` tensor in lockstep with boxes/labels, so a
+    per-detection confidence weight never de-syncs when augmentation drops boxes
+    (e.g. after RandomIoUCrop zeroes out-of-crop boxes). Behaviour is unchanged for
+    datasets without a ``weights`` key."""
+
+    def __init__(self, *args, labels_getter=_labels_and_weights_getter, **kwargs):
+        super().__init__(*args, labels_getter=labels_getter, **kwargs)
 
 
 @register()

@@ -150,6 +150,12 @@ class ConvertCocoPolysToMask(object):
 
         anno = [obj for obj in anno if "iscrowd" not in obj or obj["iscrowd"] == 0]
 
+        # Distillation: drop detections a human confirmed as false positives
+        # ("background"). They must never become positive GT; the student instead
+        # learns to suppress those regions through the standard no-object loss on
+        # the queries that go unmatched there. No-op for plain COCO (key absent).
+        anno = [obj for obj in anno if not obj.get("background", False)]
+
         boxes = [obj["bbox"] for obj in anno]
         # guard against no boxes via resizing
         boxes = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
@@ -164,6 +170,16 @@ class ConvertCocoPolysToMask(object):
             labels = [obj["category_id"] for obj in anno]
 
         labels = torch.tensor(labels, dtype=torch.int64)
+
+        # Distillation: per-detection confidence weight (the parent model's
+        # objectness). Defaults to 1.0 when absent, so human-drawn boxes and plain
+        # COCO annotations are full weight. Carried parallel to boxes/labels; the
+        # weight-aware SanitizeBoundingBoxes keeps it row-aligned when augmentation
+        # drops boxes. The criterion only consumes it when use_confidence_weighting
+        # is enabled, so emitting it here is harmless otherwise.
+        weights = torch.as_tensor(
+            [float(obj.get("score", 1.0)) for obj in anno], dtype=torch.float32
+        )
 
         if self.return_masks:
             segmentations = [obj["segmentation"] for obj in anno]
@@ -180,6 +196,7 @@ class ConvertCocoPolysToMask(object):
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
         labels = labels[keep]
+        weights = weights[keep]
         if self.return_masks:
             masks = masks[keep]
         if keypoints is not None:
@@ -188,6 +205,7 @@ class ConvertCocoPolysToMask(object):
         target = {}
         target["boxes"] = boxes
         target["labels"] = labels
+        target["weights"] = weights
         if self.return_masks:
             target["masks"] = masks
         target["image_id"] = image_id
