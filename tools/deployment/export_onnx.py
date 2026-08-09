@@ -133,35 +133,62 @@ def main(args):
     else:
         print("not load model.state_dict, use default init state dict...")
 
-    # Route deformable attention through the TensorRT plugin (always on; export-only).
-    _install_deformable_attn_plugin(cfg.model)
+    # Deformable attention has two export modes:
+    #   --trt-plugin  → MultiscaleDeformableAttnPlugin_TRT nodes. Correct
+    #                   zero-padding under TensorRT (native GridSample there
+    #                   mishandles the OOB samples deformable attention
+    #                   produces), but the graph is NOT loadable by plain
+    #                   onnxruntime — the plugin op only exists in TRT.
+    #   default       → the reference grid_sample decomposition: loadable by
+    #                   onnxruntime everywhere (the reviewer's mining/eval/
+    #                   bootstrap path consumes this).
+    if args.trt_plugin:
+        _install_deformable_attn_plugin(cfg.model)
 
     img_size = cfg.yaml_cfg["eval_spatial_size"]
 
     class Model(nn.Module):
-        def __init__(self, img_size) -> None:
+        """Deploy wrapper matching the production (betrec) engine contract.
+
+        Two inputs:
+          images            — NHWC float32 [0, 255] (converted on-graph)
+          orig_target_sizes — [N, 2] int64 (W, H) of the ORIGINAL frame each image
+                              was resized from; boxes come out in that frame's
+                              pixel space.
+        Baking orig_target_sizes as a constant (a previous revision did) produced
+        a single-input graph the production pipeline cannot load — it feeds both
+        named inputs unconditionally and crops chips in decoded-frame coordinates.
+        The deployed detector-v16.onnx carries exactly this two-input contract.
+        Consumers that want model-space boxes simply pass [[W_in, H_in]].
+        """
+
+        def __init__(self) -> None:
             super().__init__()
             self.model = cfg.model.deploy()
             self.postprocessor = cfg.postprocessor.deploy()
-            # img_size is [H, W] but postprocessor expects [W, H] (matching [x, y] box order)
-            self.register_buffer("orig_target_sizes", torch.tensor([[img_size[1], img_size[0]]], dtype=torch.int64))
 
-        def forward(self, images):
+        def forward(self, images, orig_target_sizes):
             # Input: NHWC uint8-range float32 [0, 255] → NCHW float32 [0, 1]
             images = images.permute(0, 3, 1, 2)
             images = images / 255.0
             outputs = self.model(images)
-            orig_target_sizes = self.orig_target_sizes.expand(images.shape[0], -1)
             outputs = self.postprocessor(outputs, orig_target_sizes)
             return tuple(o.to(torch.float32) for o in outputs)
 
-    model = Model(img_size)
+    model = Model()
 
-    # Input: NHWC float32, values in [0, 255]
+    # Example inputs: NHWC float32 in [0, 255], plus per-image (W, H) frame sizes
     data = torch.randint(0, 256, (1, *img_size, 3), dtype=torch.float32)
-    _ = model(data)
+    sizes = torch.tensor([[img_size[1], img_size[0]]], dtype=torch.int64)
+    _ = model(data, sizes)
 
-    dynamic_axes = {"images": {0: "N"}, "labels": {0: "N"}, "boxes": {0: "N"}, "scores": {0: "N"}}
+    dynamic_axes = {
+        "images": {0: "N"},
+        "orig_target_sizes": {0: "N"},
+        "labels": {0: "N"},
+        "boxes": {0: "N"},
+        "scores": {0: "N"},
+    }
 
     import os
     if args.output:
@@ -173,9 +200,9 @@ def main(args):
 
     torch.onnx.export(
         model,
-        (data,),
+        (data, sizes),
         output_file,
-        input_names=["images"],
+        input_names=["images", "orig_target_sizes"],
         output_names=["labels", "boxes", "scores"],
         dynamic_axes=dynamic_axes,
         opset_version=args.opset,
@@ -204,6 +231,10 @@ if __name__ == "__main__":
     parser.add_argument("--resume", "-r", type=str)
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--check", action="store_true", default=True)
+    parser.add_argument("--trt-plugin", action="store_true", default=False,
+                        help="route deformable attention through the TensorRT "
+                             "plugin (engine builds); default emits the "
+                             "onnxruntime-loadable decomposition")
     parser.add_argument("-o", "--output", type=str, help="output onnx file path")
     parser.add_argument("-u", "--update", nargs="+", help="update yaml config")
     args = parser.parse_args()

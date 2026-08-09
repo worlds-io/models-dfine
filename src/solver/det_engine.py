@@ -56,6 +56,12 @@ def train_one_epoch(
 
     model.train()
     criterion.train()
+    # Solver hook to re-apply mode overrides that model.train() just clobbered
+    # (e.g. putting frozen-backbone BatchNorm back in eval so running stats
+    # don't drift while the backbone is nominally frozen).
+    after_train_mode = kwargs.get("after_train_mode", None)
+    if after_train_mode is not None:
+        after_train_mode()
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6f}"))
 
@@ -169,6 +175,13 @@ def train_one_epoch(
                 writer.add_scalar(f"Lr/pg_{j}", pg["lr"], global_step)
             for k, v in loss_dict_reduced.items():
                 writer.add_scalar(f"Loss/{k}", v.item(), global_step)
+
+    # Discard any trailing partial accumulation window. When len(data_loader) is
+    # not a multiple of grad_accum_steps the leftover gradients were neither
+    # stepped nor zeroed, silently leaking into the first optimizer step of the
+    # next epoch.
+    if grad_accum_steps > 1 and len(data_loader) % grad_accum_steps != 0:
+        optimizer.zero_grad(set_to_none=True)
 
     metric_logger.synchronize_between_processes()
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}

@@ -43,6 +43,7 @@ class DFINECriterion(nn.Module):
         boxes_weight_format=None,
         share_matched_indices=False,
         use_confidence_weighting=False,
+        confidence_weight_normalize=True,
     ):
         """Create the criterion.
         Parameters:
@@ -55,6 +56,14 @@ class DFINECriterion(nn.Module):
             use_confidence_weighting: when True, scale each matched detection's loss by
                 its parent-model confidence (target key "weights"), for knowledge
                 distillation. When False (default) the loss is the stock D-FINE loss.
+            confidence_weight_normalize: when True (default), the per-detection weights
+                are rescaled to mean 1.0 over each matched set, so confidence acts as
+                relative emphasis between detections rather than a global down-scale of
+                the positive loss. Without this, a mean-confidence-c export multiplies
+                the whole positive gradient by ~c while the no-object term keeps full
+                strength — a systematic recall-lowering bias that also makes the
+                effective LR drift with the export's confidence distribution. All-1.0
+                weights are unaffected either way (loss stays byte-identical to stock).
         """
         super().__init__()
         self.num_classes = num_classes
@@ -64,6 +73,7 @@ class DFINECriterion(nn.Module):
         self.boxes_weight_format = boxes_weight_format
         self.share_matched_indices = share_matched_indices
         self.use_confidence_weighting = use_confidence_weighting
+        self.confidence_weight_normalize = confidence_weight_normalize
         self.alpha = alpha
         self.gamma = gamma
         self.fgl_targets, self.fgl_targets_dn = None, None
@@ -282,12 +292,23 @@ class DFINECriterion(nn.Module):
         so the returned vector lines up 1:1 with ``src_boxes``/``target_boxes``.
         Returns ``None`` when confidence weighting is disabled or no ``weights`` key
         is present — callers then leave the loss unscaled (stock D-FINE behaviour).
-        With all-1.0 weights the scaled loss equals the unscaled loss exactly."""
+        With all-1.0 weights the scaled loss equals the unscaled loss exactly.
+
+        When ``confidence_weight_normalize`` is on, the gathered weights are rescaled
+        to mean 1.0 over this matched set (per call, so every loss term / decoder layer
+        normalizes over its own matching). The callers divide weighted sums by the
+        *unweighted* box count, so without this the aggregate positive loss scales
+        with the export's mean confidence instead of staying comparable to stock."""
         if not self.use_confidence_weighting:
             return None
         if not targets or "weights" not in targets[0]:
             return None
-        return torch.cat([t["weights"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        w = torch.cat([t["weights"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        if self.confidence_weight_normalize and w.numel() > 0:
+            total = w.sum()
+            if total > 0:
+                w = w * (w.numel() / total)
+        return w
 
     def _get_go_indices(self, indices, indices_aux_list):
         """Get a matching union set across all decoder layers."""

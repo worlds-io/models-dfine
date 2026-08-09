@@ -179,6 +179,36 @@ def convert_to_coco_api(ds):
     return coco_ds
 
 
+def _coco_without_background(coco):
+    """Return a copy of a COCO index with distillation ``background: true``
+    annotations removed (no-op passthrough when none are present).
+
+    The dataset loader drops background boxes from *training* targets
+    (human-confirmed false positives must never become positive GT), but the
+    evaluator's ground truth was built straight from the raw annotation file —
+    so every reviewer-confirmed false positive still counted as a positive at
+    eval time, penalizing the student (as a false negative) for suppressing
+    exactly the regions it was trained to suppress. That corrupted the reported
+    mAP, early stopping, and best-checkpoint selection. Filtering here fixes
+    every consumer, since all evaluator GT flows through
+    ``get_coco_api_from_dataset``."""
+    anns = coco.dataset.get("annotations", [])
+    if not any(a.get("background", False) for a in anns):
+        return coco
+    kept = [a for a in anns if not a.get("background", False)]
+    filtered = type(coco)()
+    filtered.dataset = {
+        **{k: v for k, v in coco.dataset.items() if k != "annotations"},
+        "annotations": kept,
+    }
+    filtered.createIndex()
+    print(
+        f"eval GT: dropped {len(anns) - len(kept)} background (confirmed-FP) "
+        f"annotations, {len(kept)} positives remain"
+    )
+    return filtered
+
+
 def get_coco_api_from_dataset(dataset):
     # FIXME: This is... awful?
     for _ in range(10):
@@ -187,5 +217,5 @@ def get_coco_api_from_dataset(dataset):
         if isinstance(dataset, torch.utils.data.Subset):
             dataset = dataset.dataset
     if isinstance(dataset, torchvision.datasets.CocoDetection):
-        return dataset.coco
+        return _coco_without_background(dataset.coco)
     return convert_to_coco_api(dataset)

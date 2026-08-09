@@ -3,6 +3,12 @@ train_dataloader:
   dataset:
     transforms:
       ops:
+        # Serve-shape first: production frames pass through the sign's ~1147px
+        # downscale + JPEG (q 85-100) before the model ever sees them; training
+        # frames are pristine 4K captures. Degrade-and-restore (geometry
+        # untouched) so the model trains on serve-realistic detail. No-op for
+        # images already <= long_dim; kill-switch TRAIN_SERVE_SHAPE=0.
+        - {type: RandomServeShape, long_dim: 1147, q_min: 85, q_max: 100, p: 1.0}
         - {type: RandomPhotometricDistort, p: 0.5}
         - {type: RandomZoomOut, fill: 0}
         - {type: RandomIoUCrop, p: 0.8}
@@ -34,6 +40,9 @@ val_dataloader:
   dataset:
     transforms:
       ops:
+        # Deterministic serve-shape (fixed q) so val mAP measures the model under
+        # the conditions production actually serves — not pristine 4K detail.
+        - {type: RandomServeShape, long_dim: 1147, q: 93, deterministic: True}
         - {type: Resize, size: [640, 640], }
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
   # shuffle=True so the `max_val_images` cap (set from the trainer via -u) samples a

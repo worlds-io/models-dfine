@@ -274,7 +274,9 @@ class BaseSolver(object):
                 module.state_dict(), pretrain_state_dict
             )
             stat, infos = self._matched_state(module.state_dict(), adjusted_state_dict)
-        except Exception:
+        except Exception as e:
+            print(f"Head adjustment failed ({type(e).__name__}: {e}); "
+                  "mismatched heads will be freshly initialized")
             stat, infos = self._matched_state(module.state_dict(), pretrain_state_dict)
 
         module.load_state_dict(stat, strict=False)
@@ -327,17 +329,33 @@ class BaseSolver(object):
         return pretrain_state_dict
 
     def map_class_weights(self, cur_tensor, pretrain_tensor):
-        """Map class weights from pretrain model to current model based on class IDs."""
+        """Map class weights from pretrain model to current model based on class IDs.
+
+        The id mapping below only describes the Objects365 <-> COCO relationship
+        (80 COCO classes vs 365+1 Objects365 rows). For any other head size — e.g.
+        a 2-class casino fine-tune from an 80-class checkpoint — there is no
+        meaningful mapping, so return None explicitly: the caller reports the head
+        as unmatched and it is freshly initialized. Previously the loop indexed
+        out of bounds, the IndexError was swallowed upstream, and the same
+        fresh-init outcome happened by accident with no signal.
+        """
         if pretrain_tensor.size() == cur_tensor.size():
             return pretrain_tensor
+
+        n_map = len(self.obj365_ids)
+        max_obj_row = max(self.obj365_ids) + 1
 
         adjusted_tensor = cur_tensor.clone()
         adjusted_tensor.requires_grad = False
 
         if pretrain_tensor.size() > cur_tensor.size():
+            if cur_tensor.size(0) < n_map or pretrain_tensor.size(0) <= max_obj_row:
+                return None
             for coco_id, obj_id in enumerate(self.obj365_ids):
                 adjusted_tensor[coco_id] = pretrain_tensor[obj_id + 1]
         else:
+            if pretrain_tensor.size(0) < n_map or cur_tensor.size(0) <= max_obj_row:
+                return None
             for coco_id, obj_id in enumerate(self.obj365_ids):
                 adjusted_tensor[obj_id + 1] = pretrain_tensor[coco_id]
 

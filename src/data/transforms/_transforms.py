@@ -87,6 +87,76 @@ class EmptyTransform(T.Transform):
 
 
 @register()
+class RandomServeShape(T.Transform):
+    """Simulate the production capture chain on high-resolution training frames.
+
+    At serve time the sign downscales the native camera frame so its long side is
+    ``long_dim`` px (SWS_AREA) and re-encodes it as JPEG (quality ~85–100) before
+    the detector ever sees it; the frames persisted for training are the pristine
+    native-resolution captures. Without this transform the model trains on detail
+    the production pipeline can never deliver.
+
+    The image is BOX-downscaled to ``long_dim`` on its long side, JPEG
+    round-tripped at a random quality in [q_min, q_max] (fixed ``q`` when
+    ``deterministic``), then BILINEAR-upscaled back to its original size — so
+    geometry (boxes, later crops/resizes) is untouched and only the information
+    content matches serve conditions.
+
+    No-ops when the image's long side is already <= ``long_dim`` (e.g. the
+    service path pre-shrinks images to model resolution), when ``long_dim <= 0``,
+    or when the env kill-switch ``TRAIN_SERVE_SHAPE=0`` is set.
+    """
+
+    def __init__(self, long_dim=1147, q_min=85, q_max=100, p=1.0,
+                 q=93, deterministic=False, enabled=True) -> None:
+        super().__init__()
+        import os as _os
+        self.long_dim = int(long_dim)
+        self.q_min = int(q_min)
+        self.q_max = int(q_max)
+        self.p = float(p)
+        self.q = int(q)
+        self.deterministic = bool(deterministic)
+        self.enabled = bool(enabled) and _os.environ.get("TRAIN_SERVE_SHAPE", "1") != "0"
+
+    def _degrade(self, img: PIL.Image.Image) -> PIL.Image.Image:
+        import io as _io
+
+        w, h = img.size
+        long_side = max(w, h)
+        if long_side <= self.long_dim:
+            return img
+        scale = self.long_dim / long_side
+        small = (max(1, round(w * scale)), max(1, round(h * scale)))
+        if self.deterministic:
+            quality = self.q
+        else:
+            quality = int(torch.randint(self.q_min, self.q_max + 1, (1,)).item())
+        resampling = getattr(PIL.Image, "Resampling", PIL.Image)
+        rgb = img if img.mode == "RGB" else img.convert("RGB")
+        down = rgb.resize(small, resampling.BOX)
+        buf = _io.BytesIO()
+        down.save(buf, format="JPEG", quality=quality, subsampling=2)
+        buf.seek(0)
+        decoded = PIL.Image.open(buf)
+        decoded.load()
+        return decoded.resize((w, h), resampling.BILINEAR)
+
+    def forward(self, *inputs):
+        sample = inputs if len(inputs) > 1 else inputs[0]
+        if not self.enabled or self.long_dim <= 0:
+            return sample
+        if not self.deterministic and self.p < 1.0 and torch.rand(1).item() >= self.p:
+            return sample
+        if isinstance(sample, PIL.Image.Image):
+            return self._degrade(sample)
+        if isinstance(sample, (tuple, list)) and sample and isinstance(sample[0], PIL.Image.Image):
+            out = (self._degrade(sample[0]),) + tuple(sample[1:])
+            return out if isinstance(sample, tuple) else list(out)
+        return sample
+
+
+@register()
 class PadToSize(T.Pad):
     _transformed_types = (
         PIL.Image.Image,
