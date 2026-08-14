@@ -8,6 +8,7 @@ Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 
 import gc
 import math
+import os
 import sys
 from typing import Dict, Iterable, List
 
@@ -38,6 +39,11 @@ def _release_allocator_arenas() -> None:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
+
+
+# Set once the first time non-finite predictions are dumped, so a run that keeps producing
+# them writes one diagnostic checkpoint rather than a multi-hundred-MB file every step.
+_nan_dump_written = False
 
 
 def train_one_epoch(
@@ -97,16 +103,34 @@ def train_one_epoch(
                 outputs = model(samples, targets=targets)
 
             if torch.isnan(outputs["pred_boxes"]).any() or torch.isinf(outputs["pred_boxes"]).any():
-                print(outputs["pred_boxes"])
-                state = model.state_dict()
-                new_state = {}
-                for key, value in model.state_dict().items():
-                    # Replace 'module' with 'model' in each key
-                    new_key = key.replace("module.", "")
-                    # Add the updated key-value pair to the state dictionary
-                    state[new_key] = value
-                new_state["model"] = state
-                dist_utils.save_on_master(new_state, "./NaN.pth")
+                # Diagnostic only -- this must never be what ends a run. Non-finite predictions
+                # are typically a transient AMP overflow, and GradScaler already skips any step
+                # whose gradients are non-finite, so training recovers by itself. Writing the
+                # dump to the process CWD (not writable in the training container) previously
+                # raised mid-epoch and killed an otherwise healthy run at epoch 13 of 50.
+                global _nan_dump_written
+
+                pred_boxes = outputs["pred_boxes"]
+                print(
+                    f"WARNING: non-finite pred_boxes at epoch {epoch} step {i} - "
+                    f"{int(torch.isnan(pred_boxes).sum())} NaN, {int(torch.isinf(pred_boxes).sum())} Inf "
+                    f"of {pred_boxes.numel()} values. GradScaler will skip this update.",
+                    flush=True,
+                )
+
+                if not _nan_dump_written and output_dir is not None:
+                    _nan_dump_written = True
+                    try:
+                        state = model.state_dict()
+                        for key, value in list(state.items()):
+                            # Mirror each 'module.'-prefixed key so the dump loads with or
+                            # without the DDP wrapper.
+                            state[key.replace("module.", "")] = value
+                        dist_utils.save_on_master(
+                            {"model": state}, os.path.join(str(output_dir), "NaN.pth")
+                        )
+                    except Exception as dump_error:  # diagnostics must not break training
+                        print(f"WARNING: could not write NaN diagnostic dump: {dump_error}", flush=True)
 
             with torch.autocast(device_type=str(device), enabled=False):
                 loss_dict = criterion(outputs, targets, **metas)
