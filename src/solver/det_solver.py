@@ -93,7 +93,14 @@ class DetSolver(BaseSolver):
                 use_wandb=False,
                 output_dir=self.output_dir,
                 gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
-                after_train_mode=self._backbone_norm_eval,
+                # First trained epoch runs BN in train mode so running stats adapt to
+                # THIS checkpoint's activations before eval-freezing them. Transplanted
+                # checkpoints (ONNX->pth) pair fused conv weights with the reference
+                # model's pretrained BN stats — eval-mode BN on those unnormalized
+                # activations overflows under AMP (NaN in the very first forward), and
+                # no checkpoint field distinguishes trusted stats (num_batches_tracked
+                # is 0 even in trained D-FINE checkpoints).
+                after_train_mode=self._backbone_norm_eval if epoch > start_epoch else None,
             )
 
             if stage == 1 and (self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished()):

@@ -8,6 +8,7 @@ Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 
 import gc
 import math
+import os
 import sys
 from typing import Dict, Iterable, List
 
@@ -79,6 +80,13 @@ def train_one_epoch(
     output_dir = kwargs.get("output_dir", None)
     num_visualization_sample_batch = kwargs.get("num_visualization_sample_batch", 1)
 
+    # bf16 keeps fp32's dynamic range: this model's decoder FFN activations
+    # legitimately peak past fp16's 65504 max on transplanted (onnx->pth)
+    # starts, which NaN'd the very first forward under fp16 autocast.
+    amp_dtype = (torch.bfloat16
+                 if str(device).startswith("cuda") and torch.cuda.is_bf16_supported()
+                 else torch.float16)
+
     for i, (samples, targets) in enumerate(
         metric_logger.log_every(data_loader, print_freq, header)
     ):
@@ -99,11 +107,11 @@ def train_one_epoch(
         is_accum_step = (i + 1) % grad_accum_steps != 0
 
         if scaler is not None:
-            with torch.autocast(device_type=str(device), cache_enabled=True):
+            with torch.autocast(device_type=str(device), dtype=amp_dtype, cache_enabled=True):
                 outputs = model(samples, targets=targets)
 
             if torch.isnan(outputs["pred_boxes"]).any() or torch.isinf(outputs["pred_boxes"]).any():
-                print(outputs["pred_boxes"])
+                print(f"NaN/inf in pred_boxes at epoch {epoch} iter {i}")
                 state = model.state_dict()
                 new_state = {}
                 for key, value in model.state_dict().items():
@@ -112,7 +120,13 @@ def train_one_epoch(
                     # Add the updated key-value pair to the state dictionary
                     state[new_key] = value
                 new_state["model"] = state
-                dist_utils.save_on_master(new_state, "./NaN.pth")
+                # Best-effort diagnostic dump: the container cwd is read-only, and a
+                # failed dump must not crash the run on top of the NaN it reports.
+                dump_dir = kwargs.get("output_dir") or "."
+                try:
+                    dist_utils.save_on_master(new_state, os.path.join(str(dump_dir), "NaN.pth"))
+                except Exception as e:  # noqa: BLE001
+                    print(f"NaN.pth dump failed ({type(e).__name__}: {e}); continuing")
 
             with torch.autocast(device_type=str(device), enabled=False):
                 loss_dict = criterion(outputs, targets, **metas)
