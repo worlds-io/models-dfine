@@ -104,6 +104,11 @@ def train_one_epoch(
         if multiscale_size is not None:
             samples = torch.nn.functional.interpolate(samples, size=multiscale_size)
 
+        # Confirmed-FP rows must be split out BEFORE the model forward — the
+        # decoder builds denoising groups from targets, and an offset-shifted
+        # label would index past the class embedding.
+        criterion._split_hard_negatives(targets)
+
         is_accum_step = (i + 1) % grad_accum_steps != 0
 
         if scaler is not None:

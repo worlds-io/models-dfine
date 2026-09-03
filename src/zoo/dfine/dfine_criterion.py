@@ -19,6 +19,13 @@ from ...misc.dist_utils import get_world_size, is_dist_available_and_initialized
 from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
 from .dfine_utils import bbox2distance
 
+# Human-confirmed FP boxes ride through the transform pipeline as ordinary
+# target rows with their class shifted by this offset (they must share the
+# geometric transforms with real boxes). The criterion strips them out of the
+# targets before matching and uses them as hard negatives. Must match the
+# offset applied in data/dataset/coco_dataset.py.
+HARD_NEG_LABEL_OFFSET = 1000
+
 
 @register()
 class DFINECriterion(nn.Module):
@@ -44,6 +51,7 @@ class DFINECriterion(nn.Module):
         share_matched_indices=False,
         use_confidence_weighting=False,
         confidence_weight_normalize=True,
+        hard_negative_weight=1.0,
     ):
         """Create the criterion.
         Parameters:
@@ -64,6 +72,14 @@ class DFINECriterion(nn.Module):
                 strength — a systematic recall-lowering bias that also makes the
                 effective LR drift with the export's confidence distribution. All-1.0
                 weights are unaffected either way (loss stays byte-identical to stock).
+            hard_negative_weight: > 1.0 turns human-confirmed FP boxes (dataset rows
+                whose label carries HARD_NEG_LABEL_OFFSET, from `background`-flagged
+                annotations) into targeted supervision: the negative-side VFL of any
+                unmatched query whose predicted box lands on such a box (IoU ≥ 0.5) is
+                scaled by this factor for that box's class. The stock no-object loss
+                treats curated FP regions like any unlabeled pixel — measured on a
+                frozen holdout, 5× more curated cards FPs in training moved cards
+                precision nowhere. 1.0 (default) = stock loss, byte-identical.
         """
         super().__init__()
         self.num_classes = num_classes
@@ -74,6 +90,7 @@ class DFINECriterion(nn.Module):
         self.share_matched_indices = share_matched_indices
         self.use_confidence_weighting = use_confidence_weighting
         self.confidence_weight_normalize = confidence_weight_normalize
+        self.hard_negative_weight = float(hard_negative_weight)
         self.alpha = alpha
         self.gamma = gamma
         self.fgl_targets, self.fgl_targets_dn = None, None
@@ -123,6 +140,8 @@ class DFINECriterion(nn.Module):
 
         pred_score = F.sigmoid(src_logits).detach()
         weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
+        if self.hard_negative_weight > 1.0:
+            weight = self._apply_hard_negative_weight(outputs, targets, idx, weight)
 
         loss = F.binary_cross_entropy_with_logits(
             src_logits, target_score, weight=weight, reduction="none"
@@ -283,6 +302,46 @@ class DFINECriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
+    @staticmethod
+    def _split_hard_negatives(targets):
+        """Strip HARD_NEG_LABEL_OFFSET-marked rows out of the targets (they must
+        never reach the matcher or count as GT) into ``neg_boxes``/``neg_labels``.
+        In-place and idempotent — after the first call no offset labels remain."""
+        for t in targets:
+            labels = t.get("labels")
+            if labels is None or not len(labels):
+                continue
+            neg = labels >= HARD_NEG_LABEL_OFFSET
+            if not bool(neg.any()):
+                continue
+            t["neg_boxes"] = t["boxes"][neg]
+            t["neg_labels"] = labels[neg] - HARD_NEG_LABEL_OFFSET
+            t["boxes"] = t["boxes"][~neg]
+            t["labels"] = labels[~neg]
+            if "weights" in t and len(t["weights"]) == len(neg):
+                t["weights"] = t["weights"][~neg]
+
+    def _apply_hard_negative_weight(self, outputs, targets, matched_idx, weight):
+        """Scale the negative-side VFL of unmatched queries whose predicted box
+        sits on a confirmed-FP box (IoU ≥ 0.5) for that box's class. Matched
+        queries are exempt — a real GT box may overlap a neg box."""
+        matched = torch.zeros(weight.shape[:2], dtype=torch.bool, device=weight.device)
+        matched[matched_idx] = True
+        for b, t in enumerate(targets):
+            nb = t.get("neg_boxes")
+            if nb is None or len(nb) == 0:
+                continue
+            ious, _ = box_iou(
+                box_cxcywh_to_xyxy(outputs["pred_boxes"][b].detach()),
+                box_cxcywh_to_xyxy(nb))                       # [Q, M]
+            for m, cls_ in enumerate(t["neg_labels"].tolist()):
+                if cls_ >= self.num_classes:
+                    continue
+                hit = (ious[:, m] >= 0.5) & ~matched[b]
+                if bool(hit.any()):
+                    weight[b, hit, int(cls_)] *= self.hard_negative_weight
+        return weight
+
     def _matched_confidence_weights(self, targets, indices):
         """Per-matched-GT distillation weights, row-aligned with the matched
         predictions.
@@ -357,6 +416,7 @@ class DFINECriterion(nn.Module):
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if "aux" not in k}
         self._clear_cache()
+        self._split_hard_negatives(targets)
 
         # Batch all matcher calls into a single pass. Originally the main output + ~6
         # decoder aux outputs + pre_outputs + each encoder aux output each called

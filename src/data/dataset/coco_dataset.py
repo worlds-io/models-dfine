@@ -16,6 +16,12 @@ from ...core import register
 from .._misc import convert_to_tv_tensor
 from ._dataset import DetDataset
 
+# Human-confirmed FP ("background") rows keep their class shifted by this
+# offset so they survive the transform pipeline as ordinary boxes; the
+# criterion strips them before matching/denoising and uses them as hard
+# negatives. Must match zoo/dfine/dfine_criterion.py HARD_NEG_LABEL_OFFSET.
+HARD_NEG_LABEL_OFFSET = 1000
+
 torchvision.disable_beta_transforms_warning()
 Image.MAX_IMAGE_PIXELS = None
 
@@ -150,11 +156,16 @@ class ConvertCocoPolysToMask(object):
 
         anno = [obj for obj in anno if "iscrowd" not in obj or obj["iscrowd"] == 0]
 
-        # Distillation: drop detections a human confirmed as false positives
-        # ("background"). They must never become positive GT; the student instead
-        # learns to suppress those regions through the standard no-object loss on
-        # the queries that go unmatched there. No-op for plain COCO (key absent).
-        anno = [obj for obj in anno if not obj.get("background", False)]
+        # Distillation: detections a human confirmed as false positives
+        # ("background") must never become positive GT — but they are not
+        # dropped either. They stay in the target as HARD_NEG_LABEL_OFFSET-
+        # shifted rows so they ride the same geometric transforms as real
+        # boxes; the criterion splits them back out before matching/denoising
+        # and (with hard_negative_weight > 1) turns them into targeted
+        # negative supervision. Dropping them left only the diffuse no-object
+        # loss, which measurably failed to suppress recurring FP types.
+        # No-op for plain COCO (key absent).
+        neg_mask = [bool(obj.get("background", False)) for obj in anno]
 
         boxes = [obj["bbox"] for obj in anno]
         # guard against no boxes via resizing
@@ -170,6 +181,9 @@ class ConvertCocoPolysToMask(object):
             labels = [obj["category_id"] for obj in anno]
 
         labels = torch.tensor(labels, dtype=torch.int64)
+        if any(neg_mask):
+            labels = labels + HARD_NEG_LABEL_OFFSET * torch.tensor(
+                neg_mask, dtype=torch.int64)
 
         # Distillation: per-detection confidence weight (the parent model's
         # objectness). Defaults to 1.0 when absent, so human-drawn boxes and plain
