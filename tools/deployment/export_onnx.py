@@ -29,9 +29,14 @@ from src.zoo.dfine.dfine_decoder import MSDeformableAttention
 # instead. The plugin ships in libnvinfer_plugin, so no custom build is needed; TensorRT
 # auto-registers it at engine build and inference-engine initializes it at load.
 #
-# This is always on: every exported D-FINE ONNX uses the plugin. It changes only the
-# exported graph — training and eager inference are untouched (the Function's forward is
-# the same reference math, used only to trace shapes during export).
+# This is on by default: the artifact a model row points at is the TensorRT build. It changes
+# only the exported graph — training and eager inference are untouched (the Function's forward
+# is the same reference math, used only to trace shapes during export).
+#
+# --no-trt-plugin turns it off, producing the standard-operator build published beside the
+# default under the "_cpu" name. ONNX Runtime cannot load a plugin node at all, so a CPU host
+# has no way to run the default artifact; the portable graph below is what it gets instead. The
+# two builds share weights and math and differ only in how deformable attention is expressed.
 
 
 class _MSDeformAttnPlugin(torch.autograd.Function):
@@ -133,8 +138,11 @@ def main(args):
     else:
         print("not load model.state_dict, use default init state dict...")
 
-    # Route deformable attention through the TensorRT plugin (always on; export-only).
-    _install_deformable_attn_plugin(cfg.model)
+    # Route deformable attention through the TensorRT plugin (export-only).
+    if args.no_trt_plugin:
+        print("deformable attention -> portable grid_sample decomposition (CPU build)")
+    else:
+        _install_deformable_attn_plugin(cfg.model)
 
     img_size = cfg.yaml_cfg["eval_spatial_size"]
 
@@ -205,6 +213,9 @@ if __name__ == "__main__":
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--check", action="store_true", default=True)
     parser.add_argument("-o", "--output", type=str, help="output onnx file path")
+    parser.add_argument("--no-trt-plugin", action="store_true",
+                        help="export deformable attention as standard operators instead of the "
+                             "TensorRT plugin, for the ONNX Runtime ('_cpu') build")
     parser.add_argument("-u", "--update", nargs="+", help="update yaml config")
     args = parser.parse_args()
     main(args)
