@@ -80,6 +80,10 @@ class BaseConfig(object):
         # finetuning
         self.early_stopping_patience: int = 0
         self.early_stopping_min_delta: float = 0
+        # Early stopping (the stage 1 -> 2 transition and the final stop) cannot fire before this many
+        # epochs have run. Patience counts epochs, and on a small dataset two flat epochs are a few dozen
+        # steps -- training otherwise quits at epoch 3 of a 300+ epoch budget. 0 = no minimum
+        self.min_epochs: int = 0
         self.gradient_accumulation_steps: int = 1
 
         # Cap on val-set size per eval. Full val loops accumulate predictions for every

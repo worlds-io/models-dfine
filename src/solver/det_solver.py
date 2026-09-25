@@ -33,6 +33,7 @@ class DetSolver(BaseSolver):
 
         early_stopping_patience = getattr(args, 'early_stopping_patience', 0)
         early_stopping_min_delta = getattr(args, 'early_stopping_min_delta', 0)
+        min_epochs = getattr(args, 'min_epochs', 0)
 
         top1 = 0
         best_stat = {"epoch": -1}
@@ -167,8 +168,12 @@ class DetSolver(BaseSolver):
                 print(f"mAP did not improve in epoch {epoch + 1} ({prev_best:.3f} -> {current_map:.3f}), completed in {epoch_time}s")
                 epochs_without_improvement += 1
 
-            # Early stopping: transition stages or stop training
-            if early_stopping_patience > 0 and epochs_without_improvement >= early_stopping_patience:
+            # Early stopping: transition stages or stop training -- never before min_epochs have run
+            if (
+                early_stopping_patience > 0
+                and epochs_without_improvement >= early_stopping_patience
+                and epoch + 1 >= min_epochs
+            ):
                 if stage == 1:
                     print(f"Stage 1 early stopping at epoch {epoch + 1} (no improvement for {early_stopping_patience} epochs)")
                     self._enter_stage2(epoch)
