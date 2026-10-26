@@ -189,6 +189,12 @@ def main(args):
         opset_version=args.opset,
         verbose=False,
         do_constant_folding=True,
+        # torch >= 2.9 defaults to the torch.export-based exporter, which cannot export
+        # _MSDeformAttnPlugin (it fails with TorchExportError; the TensorRT node comes from
+        # .symbolic, which only the TorchScript exporter honours) and writes the weights to a
+        # separate .onnx.data file. Pin the TorchScript exporter this graph was built and
+        # validated against.
+        dynamo=False,
     )
 
     import onnx
