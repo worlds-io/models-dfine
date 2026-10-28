@@ -5,6 +5,7 @@ Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+import faster_coco_eval
 import faster_coco_eval.core.mask as coco_mask
 from faster_coco_eval.utils.pytorch import FasterCocoDetection
 import torch
@@ -32,6 +33,10 @@ class CocoDetection(FasterCocoDetection, DetDataset):
     def __init__(
         self, img_folder, ann_file, transforms, return_masks=False, remap_mscoco_category=False
     ):
+        # This skips FasterCocoDetection.__init__ and goes straight to torchvision's CocoDetection,
+        # which imports pycocotools. faster-coco-eval 1.8 only aliases itself as pycocotools in its
+        # own __init__ (1.6 did it on import), so the alias has to be installed here.
+        faster_coco_eval.init_as_pycocotools()
         super(FasterCocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.prepare = ConvertCocoPolysToMask(return_masks)

@@ -96,8 +96,11 @@ class PadToSize(T.Pad):
         BoundingBoxes,
     )
 
-    def _get_params(self, flat_inputs: List[Any]) -> Dict[str, Any]:
-        sp = F.get_spatial_size(flat_inputs[0])
+    # torchvision >= 0.21 dispatches make_params/transform (not _get_params/_transform);
+    # F.get_spatial_size was renamed F.get_size in 0.16. T.Pad.transform pads with self.padding,
+    # so only the params step is needed.
+    def make_params(self, flat_inputs: List[Any]) -> Dict[str, Any]:
+        sp = F.get_size(flat_inputs[0])
         h, w = self.size[1] - sp[0], self.size[0] - sp[1]
         self.padding = [0, 0, w, h]
         return dict(padding=self.padding)
@@ -107,11 +110,6 @@ class PadToSize(T.Pad):
             size = (size, size)
         self.size = size
         super().__init__(0, fill, padding_mode)
-
-    def _transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
-        fill = self._fill[type(inpt)]
-        padding = params["padding"]
-        return F.pad(inpt, padding=padding, fill=fill, padding_mode=self.padding_mode)  # type: ignore[arg-type]
 
     def __call__(self, *inputs: Any) -> Any:
         outputs = super().forward(*inputs)
