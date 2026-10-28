@@ -96,8 +96,9 @@ class PadToSize(T.Pad):
         BoundingBoxes,
     )
 
-    # torchvision >= 0.17 dispatches make_params/transform (not _get_params/_transform) and has no
-    # F.get_spatial_size. T.Pad.transform pads with self.padding, so only the params step is needed.
+    # torchvision >= 0.21 dispatches make_params/transform (not _get_params/_transform);
+    # F.get_spatial_size was renamed F.get_size in 0.16. T.Pad.transform pads with self.padding,
+    # so only the params step is needed.
     def make_params(self, flat_inputs: List[Any]) -> Dict[str, Any]:
         sp = F.get_size(flat_inputs[0])
         h, w = self.size[1] - sp[0], self.size[0] - sp[1]
