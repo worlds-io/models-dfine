@@ -131,9 +131,9 @@ def _install_deformable_attn_plugin(model):
 #
 # K is num_top_queries, the same K as the other three outputs, and row k of embeddings belongs to
 # row k of labels/boxes/scores. A consumer that reads only labels/boxes/scores by name gets exactly
-# the detections it got before; inference-engine's sweeps read embeddings too, to group and
-# cluster detections without a second embedding model. The extra output is one gather of a tensor
-# the decoder computes anyway: TensorRT compute time is unchanged.
+# the detections it got before; one that reads embeddings too can compare, group or cluster
+# detections without running a second embedding model on each crop. The extra output is one gather
+# of a tensor the decoder computes anyway: TensorRT compute time is unchanged.
 #
 # DFINEPostProcessor discards the query index its top-K selects, so the export does the focal-loss
 # branch itself, line for line, and keeps the index. _check_matches_postprocessor holds the two to
