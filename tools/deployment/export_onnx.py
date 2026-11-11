@@ -14,9 +14,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 
 from src.core import YAMLConfig, yaml_utils
 from src.zoo.dfine.dfine_decoder import MSDeformableAttention
+from src.zoo.dfine.postprocessor import mod
 
 
 # ── TensorRT deformable-attention plugin export ──────────────────────────────
@@ -119,6 +121,42 @@ def _install_deformable_attn_plugin(model):
     print(f"deformable attention -> MultiscaleDeformableAttnPlugin_TRT on {n} module(s)")
 
 
+# ── Per-detection embeddings ─────────────────────────────────────────────────
+# Every export emits a fourth output beside labels/boxes/scores:
+#
+#   embeddings [N, K, D]  the decoder state of each (query, class) pair's query: the output of
+#                         decoder.decoder.layers[eval_idx], the tensor the score head reads
+#                         (D = the decoder's hidden_dim: 128 for Nano, 256 for S/M/L/X), float32,
+#                         not normalized
+#
+# K is num_top_queries, the same K as the other three outputs, and row k of embeddings belongs to
+# row k of labels/boxes/scores. A consumer that reads only labels/boxes/scores by name gets exactly
+# the detections it got before; one that reads embeddings too can compare, group or cluster
+# detections without running a second embedding model on each crop. The extra output is one gather
+# of a tensor the decoder computes anyway: TensorRT compute time is unchanged.
+#
+# DFINEPostProcessor discards the query index its top-K selects, so the export does the focal-loss
+# branch itself, line for line, and keeps the index. _check_matches_postprocessor checks that the
+# two agree on the eager model before every export.
+
+
+def _decoder_eval_layer(model):
+    """The decoder layer whose output the deployed score head reads (eval_idx), after deploy()."""
+    transformer_decoder = model.decoder.decoder
+    return transformer_decoder.layers[transformer_decoder.eval_idx]
+
+
+def _check_matches_postprocessor(model, images):
+    """Fail the export if its labels/boxes/scores differ from DFINEPostProcessor's on `images`."""
+    with torch.no_grad():
+        exported = model(images)[:3]
+        reference = model.postprocessor(model.model(images.permute(0, 3, 1, 2) / 255.0),
+                                        model.orig_target_sizes.expand(images.shape[0], -1))
+    for name, ours, theirs in zip(("labels", "boxes", "scores"), exported, reference):
+        if not torch.equal(ours, theirs.to(torch.float32)):
+            raise SystemExit(f"exported {name} differ from DFINEPostProcessor's")
+
+
 def main(args):
     """main"""
     update_dict = yaml_utils.parse_cli(args.update) if args.update else {}
@@ -151,25 +189,52 @@ def main(args):
             super().__init__()
             self.model = cfg.model.deploy()
             self.postprocessor = cfg.postprocessor.deploy()
+            # Every D-FINE config uses the focal-loss postprocessor; it is the branch whose top-K
+            # pairs carry a query index to gather embeddings by.
+            if not self.postprocessor.use_focal_loss:
+                raise SystemExit("export supports only the focal-loss postprocessor (every D-FINE config)")
+            self.num_classes = self.postprocessor.num_classes
+            self.num_top_queries = self.postprocessor.num_top_queries
             # img_size is [H, W] but postprocessor expects [W, H] (matching [x, y] box order)
             self.register_buffer("orig_target_sizes", torch.tensor([[img_size[1], img_size[0]]], dtype=torch.int64))
+            # The eval layer's output is captured by a hook, since the decoder returns only the heads'
+            # results. Registered after deploy(), which truncates the layers to eval_idx + 1.
+            self.decoder_state = None
+            _decoder_eval_layer(self.model).register_forward_hook(self._capture_decoder_state)
+
+        def _capture_decoder_state(self, module, inputs, output):
+            self.decoder_state = output
 
         def forward(self, images):
             # Input: NHWC uint8-range float32 [0, 255] → NCHW float32 [0, 1]
             images = images.permute(0, 3, 1, 2)
             images = images / 255.0
+            self.decoder_state = None
             outputs = self.model(images)
             orig_target_sizes = self.orig_target_sizes.expand(images.shape[0], -1)
-            outputs = self.postprocessor(outputs, orig_target_sizes)
-            return tuple(o.to(torch.float32) for o in outputs)
+
+            # DFINEPostProcessor.forward, focal-loss branch, keeping the query index it discards.
+            logits, boxes = outputs["pred_logits"], outputs["pred_boxes"]
+            bbox_pred = torchvision.ops.box_convert(boxes, in_fmt="cxcywh", out_fmt="xyxy")
+            bbox_pred *= orig_target_sizes.repeat(1, 2).unsqueeze(1)
+            scores = F.sigmoid(logits)
+            scores, index = torch.topk(scores.flatten(1), self.num_top_queries, dim=-1)
+            labels = mod(index, self.num_classes)
+            index = index // self.num_classes
+            boxes = bbox_pred.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, bbox_pred.shape[-1]))
+
+            decoder_state = self.decoder_state
+            embeddings = decoder_state.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, decoder_state.shape[-1]))
+            return tuple(o.to(torch.float32) for o in (labels, boxes, scores, embeddings))
 
     model = Model(img_size)
 
     # Input: NHWC float32, values in [0, 255]
     data = torch.randint(0, 256, (1, *img_size, 3), dtype=torch.float32)
-    _ = model(data)
+    _check_matches_postprocessor(model, data)
 
-    dynamic_axes = {"images": {0: "N"}, "labels": {0: "N"}, "boxes": {0: "N"}, "scores": {0: "N"}}
+    output_names = ["labels", "boxes", "scores", "embeddings"]
+    dynamic_axes = {name: {0: "N"} for name in ["images", *output_names]}
 
     import os
     if args.output:
@@ -184,7 +249,7 @@ def main(args):
         (data,),
         output_file,
         input_names=["images"],
-        output_names=["labels", "boxes", "scores"],
+        output_names=output_names,
         dynamic_axes=dynamic_axes,
         opset_version=args.opset,
         verbose=False,
