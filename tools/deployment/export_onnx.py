@@ -125,7 +125,7 @@ def _install_deformable_attn_plugin(model):
 # Every export emits a fourth output beside labels/boxes/scores:
 #
 #   embeddings [N, K, D]  the decoder state of each (query, class) pair's query: the output of
-#                         decoder.decoder.layers[eval_idx], the tensor the score and box heads read
+#                         decoder.decoder.layers[eval_idx], the tensor the score head reads
 #                         (D = the decoder's hidden_dim: 128 for Nano, 256 for S/M/L/X), float32,
 #                         not normalized
 #
@@ -136,17 +136,14 @@ def _install_deformable_attn_plugin(model):
 # of a tensor the decoder computes anyway: TensorRT compute time is unchanged.
 #
 # DFINEPostProcessor discards the query index its top-K selects, so the export does the focal-loss
-# branch itself, line for line, and keeps the index. _check_matches_postprocessor holds the two to
-# the same result on every export.
+# branch itself, line for line, and keeps the index. _check_matches_postprocessor checks that the
+# two agree on the eager model before every export.
 
 
 def _decoder_eval_layer(model):
-    """The decoder layer whose output the deployed heads read (eval_idx), after deploy()."""
+    """The decoder layer whose output the deployed score head reads (eval_idx), after deploy()."""
     transformer_decoder = model.decoder.decoder
-    eval_index = transformer_decoder.eval_idx
-    if eval_index < 0:
-        eval_index += len(transformer_decoder.layers)
-    return transformer_decoder.layers[eval_index]
+    return transformer_decoder.layers[transformer_decoder.eval_idx]
 
 
 def _check_matches_postprocessor(model, images):
